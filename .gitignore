@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+
+# Local configuration
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# Native build output
+**/.cxx/
+**/obj/
+**/libs/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+
+.kotlin/
+*.log
