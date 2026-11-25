@@ -88,6 +88,7 @@ import com.novavm.app.NovaVmApp
 import com.novavm.app.data.VmProfile
 import com.novavm.app.engine.RfbProtocol
 import com.novavm.app.location.GeoMath
+import com.novavm.app.location.RouteSimulator
 import com.novavm.app.ui.components.NovaTag
 import com.novavm.app.ui.theme.NovaPalette
 import com.novavm.app.ui.theme.NovaVmTheme
@@ -127,6 +128,11 @@ class VmDisplayActivity : ComponentActivity() {
     private var gpsLatitude by mutableStateOf(0.0)
     private var gpsLongitude by mutableStateOf(0.0)
 
+    // Route playback HUD state, fed by the process-wide RouteSimulator.
+    private var routeAvailable by mutableStateOf(false)
+    private var routePlaying by mutableStateOf(false)
+    private var routeProgress by mutableStateOf("")
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val application = application as NovaVmApp
@@ -147,6 +153,7 @@ class VmDisplayActivity : ComponentActivity() {
         gpsLatitude = loaded.virtualLocation.latitude
         gpsLongitude = loaded.virtualLocation.longitude
         gpsPadVisible = loaded.virtualLocation.enabled
+        routeAvailable = loaded.virtualLocation.routeWaypoints.size >= 2
 
         val runtime = application.vmInstanceManager.state(loaded.id)
         if (runtime?.isRunning != true) {
@@ -191,6 +198,31 @@ class VmDisplayActivity : ComponentActivity() {
             }
         }
 
+        lifecycleScope.launch {
+            application.routeSimulator.playbackStates.collect { states ->
+                val playback = states[loaded.id]
+                routePlaying = playback?.isPlaying == true
+                routeProgress = playback?.takeIf { it.hasRoute }
+                    ?.let { RouteSimulator.progressText(it) }
+                    .orEmpty()
+            }
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                val fresh = runCatching { application.vmRepository.get(loaded.id) }.getOrNull()
+                val available = (fresh?.virtualLocation?.routeWaypoints?.size ?: 0) >= 2
+                withContext(Dispatchers.Main) {
+                    routeAvailable = available
+                    if (fresh != null) {
+                        gpsLatitude = fresh.virtualLocation.latitude
+                        gpsLongitude = fresh.virtualLocation.longitude
+                    }
+                }
+                delay(2_000)
+            }
+        }
+
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (isInPip) return
@@ -212,9 +244,13 @@ class VmDisplayActivity : ComponentActivity() {
                     gpsPadVisible = gpsPadVisible,
                     gpsLatitude = gpsLatitude,
                     gpsLongitude = gpsLongitude,
+                    routeAvailable = routeAvailable,
+                    routePlaying = routePlaying,
+                    routeProgress = routeProgress,
                     onToggleHud = { hudVisible = !hudVisible },
                     onToggleGpsPad = { gpsPadVisible = !gpsPadVisible },
                     onGpsNudge = { bearing -> nudgeGps(bearing) },
+                    onToggleRoute = { toggleRouteSimulation() },
                     onPauseResume = { togglePause() },
                     onSnapshot = { takeSnapshot() },
                     onNavBack = { sendKeysym(RfbProtocol.KEYSYM_ESCAPE) },
@@ -410,6 +446,35 @@ class VmDisplayActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Starts or pauses route movement straight from the display HUD, so the
+     * guest keeps walking along the planned waypoints while the VM screen is
+     * being watched fullscreen.
+     */
+    private fun toggleRouteSimulation() {
+        val loaded = profile ?: return
+        val application = app ?: return
+        val playing = application.routeSimulator.playbackState(loaded.id)?.isPlaying == true
+        val changed = if (playing) {
+            application.routeSimulator.pause(loaded.id)
+        } else {
+            application.routeSimulator.start(loaded.id)
+        }
+        if (!changed) {
+            Toast.makeText(this, "请先在虚拟机详情中规划至少两个途经点", Toast.LENGTH_SHORT).show()
+            return
+        }
+        routePlaying = !playing
+        pipeline?.appendConsole(
+            if (playing) "[GPS] route paused" else "[GPS] route playback started"
+        )
+        Toast.makeText(
+            this,
+            if (playing) "路线播放已暂停" else "路线播放已开始",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
     // ---------------------------------------------------------------- input
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -454,9 +519,13 @@ private fun VmDisplayScreen(
     gpsPadVisible: Boolean,
     gpsLatitude: Double,
     gpsLongitude: Double,
+    routeAvailable: Boolean,
+    routePlaying: Boolean,
+    routeProgress: String,
     onToggleHud: () -> Unit,
     onToggleGpsPad: () -> Unit,
     onGpsNudge: (Double) -> Unit,
+    onToggleRoute: () -> Unit,
     onPauseResume: () -> Unit,
     onSnapshot: () -> Unit,
     onNavBack: () -> Unit,
@@ -581,7 +650,11 @@ private fun VmDisplayScreen(
                 GpsQuickJoystick(
                     latitude = gpsLatitude,
                     longitude = gpsLongitude,
-                    onNudge = onGpsNudge
+                    onNudge = onGpsNudge,
+                    routeAvailable = routeAvailable,
+                    routePlaying = routePlaying,
+                    routeProgress = routeProgress,
+                    onToggleRoute = onToggleRoute
                 )
             }
         }
@@ -730,7 +803,11 @@ private fun HudBottomBar(
 private fun GpsQuickJoystick(
     latitude: Double,
     longitude: Double,
-    onNudge: (Double) -> Unit
+    onNudge: (Double) -> Unit,
+    routeAvailable: Boolean,
+    routePlaying: Boolean,
+    routeProgress: String,
+    onToggleRoute: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -779,6 +856,49 @@ private fun GpsQuickJoystick(
             GpsPadKey("↙") { onNudge(225.0) }
             GpsPadKey("↓") { onNudge(180.0) }
             GpsPadKey("↘") { onNudge(135.0) }
+        }
+        if (routeAvailable) {
+            Spacer(Modifier.height(6.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(
+                        if (routePlaying) {
+                            NovaPalette.Amber.copy(alpha = 0.22f)
+                        } else {
+                            NovaPalette.Cyan.copy(alpha = 0.18f)
+                        }
+                    )
+                    .border(
+                        1.dp,
+                        if (routePlaying) NovaPalette.Amber.copy(alpha = 0.55f)
+                        else NovaPalette.Cyan.copy(alpha = 0.45f),
+                        RoundedCornerShape(8.dp)
+                    )
+                    .clickable(onClick = onToggleRoute)
+                    .padding(vertical = 5.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (routePlaying) "路线暂停" else "路线播放",
+                    color = if (routePlaying) NovaPalette.Amber else NovaPalette.Cyan,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (routeProgress.isNotBlank()) {
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = routeProgress,
+                    color = NovaPalette.TextSecondary,
+                    fontSize = 7.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 9.sp,
+                    maxLines = 2,
+                    modifier = Modifier.width(120.dp)
+                )
+            }
         }
     }
 }

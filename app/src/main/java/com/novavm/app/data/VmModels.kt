@@ -280,6 +280,22 @@ enum class VirtualLocationMode {
     JOYSTICK
 }
 
+/**
+ * How a [VirtualLocationConfig.routeWaypoints] route advances once the last
+ * waypoint is reached.
+ */
+@Serializable
+enum class RouteLoopMode {
+    /** Stop at the final waypoint and mark the playback as finished. */
+    ONCE,
+
+    /** Jump from the last waypoint back to the first one, seamlessly. */
+    LOOP,
+
+    /** Reverse direction at both ends (A → B → A → B …). */
+    PING_PONG
+}
+
 /** A single WGS-84 coordinate, optionally labelled for route waypoints. */
 @Serializable
 data class GeoPoint(
@@ -308,7 +324,9 @@ data class VirtualLocationConfig(
     val bearingDegrees: Float = 0.0f,
     val mode: VirtualLocationMode = VirtualLocationMode.STATIC,
     val jitterEnabled: Boolean = true,
-    val routeWaypoints: List<GeoPoint> = emptyList()
+    val routeWaypoints: List<GeoPoint> = emptyList(),
+    /** Defaults to [RouteLoopMode.LOOP] so older JSON without the field still decodes. */
+    val loopMode: RouteLoopMode = RouteLoopMode.LOOP
 ) {
     val geoPoint: GeoPoint get() = GeoPoint(latitude, longitude, altitude, presetName)
 

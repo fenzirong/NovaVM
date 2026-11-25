@@ -13,6 +13,7 @@ import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmRepository
 import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.VmInstanceManager
+import com.novavm.app.location.RouteSimulator
 import com.novavm.app.location.VirtualGpsEngine
 import com.novavm.app.root.RootXposedConfigurator
 import com.novavm.app.transfer.HostGuestTransferManager
@@ -51,6 +52,15 @@ class NovaVmApp : Application() {
         ).also { manager ->
             runCatching { manager.refresh() }
         }
+    }
+
+    /**
+     * Route movement simulator shared by every screen, so playback keeps
+     * running while the user moves between the detail tab, the fullscreen
+     * display and the floating window.
+     */
+    val routeSimulator: RouteSimulator by lazy {
+        RouteSimulator(repository = vmRepository, instanceManager = vmInstanceManager)
     }
 
     private val transferManagers = ConcurrentHashMap<String, HostGuestTransferManager>()

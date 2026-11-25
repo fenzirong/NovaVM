@@ -223,6 +223,95 @@ object GeoMath {
     }
 
     /**
+     * Initial great-circle bearing from one fix to another, in degrees
+     * clockwise from true north (`0.0..360.0`, 0 == north).
+     */
+    fun bearingDegrees(
+        fromLat: Double,
+        fromLon: Double,
+        toLat: Double,
+        toLon: Double
+    ): Double {
+        if (distanceMeters(fromLat, fromLon, toLat, toLon) < 1e-6) return 0.0
+        val lat1 = Math.toRadians(clampLat(fromLat))
+        val lat2 = Math.toRadians(clampLat(toLat))
+        val deltaLon = Math.toRadians(normalizeLon(toLon) - normalizeLon(fromLon))
+        val y = sin(deltaLon) * cos(lat2)
+        val x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(deltaLon)
+        val degrees = Math.toDegrees(atan2(y, x))
+        return (degrees + 360.0) % 360.0
+    }
+
+    /**
+     * Great-circle interpolation between two fixes.
+     *
+     * [fraction] is clamped to `0.0..1.0`; altitude is interpolated linearly and
+     * the label of [from] is preserved so route stepping keeps its naming.
+     */
+    fun interpolatePosition(from: GeoPoint, to: GeoPoint, fraction: Double): GeoPoint {
+        val ratio = fraction.coerceIn(0.0, 1.0)
+        val altitude = from.altitude + (to.altitude - from.altitude) * ratio
+        if (ratio <= 0.0) return from
+        if (ratio >= 1.0) return to.copy(altitude = altitude)
+
+        val lat1 = Math.toRadians(clampLat(from.latitude))
+        val lon1 = Math.toRadians(normalizeLon(from.longitude))
+        val lat2 = Math.toRadians(clampLat(to.latitude))
+        val lon2 = Math.toRadians(normalizeLon(to.longitude))
+        val deltaLat = lat2 - lat1
+        val deltaLon = lon2 - lon1
+        val sinHalf = sin(deltaLat / 2) * sin(deltaLat / 2) +
+            cos(lat1) * cos(lat2) * sin(deltaLon / 2) * sin(deltaLon / 2)
+        val angular = 2 * asin(sqrt(sinHalf).coerceIn(0.0, 1.0))
+        if (angular < 1e-12) return from.copy(altitude = altitude)
+
+        val sinAngular = sin(angular)
+        val a = sin((1.0 - ratio) * angular) / sinAngular
+        val b = sin(ratio * angular) / sinAngular
+        val x = a * cos(lat1) * cos(lon1) + b * cos(lat2) * cos(lon2)
+        val y = a * cos(lat1) * sin(lon1) + b * cos(lat2) * sin(lon2)
+        val z = a * sin(lat1) + b * sin(lat2)
+        return GeoPoint(
+            latitude = clampLat(Math.toDegrees(atan2(z, sqrt(x * x + y * y)))),
+            longitude = normalizeLon(Math.toDegrees(atan2(y, x))),
+            altitude = altitude,
+            label = from.label
+        )
+    }
+
+    /** Sum of every leg of a polyline through [waypoints]; 0 for < 2 points. */
+    fun totalRouteDistanceMeters(waypoints: List<GeoPoint>): Double {
+        if (waypoints.size < 2) return 0.0
+        var total = 0.0
+        for (index in 0 until waypoints.size - 1) {
+            val from = waypoints[index]
+            val to = waypoints[index + 1]
+            total += distanceMeters(from.latitude, from.longitude, to.latitude, to.longitude)
+        }
+        return total
+    }
+
+    /**
+     * Six waypoints forming a closed loop around a center, used by the
+     * one-tap "generate sample route" action so route movement can be tried
+     * immediately without hand-placing points.
+     */
+    fun generateSampleLoopRoute(
+        centerLat: Double,
+        centerLon: Double,
+        radiusMeters: Double = 300.0
+    ): List<GeoPoint> {
+        val radius = radiusMeters.coerceIn(10.0, 5_000.0)
+        return (0 until 6).map { index ->
+            val bearing = index * 60.0
+            stepPosition(centerLat, centerLon, bearing, radius).copy(
+                altitude = 35.0,
+                label = "示例点 ${index + 1}"
+            )
+        }
+    }
+
+    /**
      * Adds a random offset of at most [maxMeters] so a static mock fix still
      * looks like a live GNSS solution.
      */

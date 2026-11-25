@@ -9,10 +9,13 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.novavm.app.NovaVmApp
 import com.novavm.app.data.DeviceSpoofConfig
+import com.novavm.app.data.GeoPoint
 import com.novavm.app.data.ImportedRom
 import com.novavm.app.data.RomCatalogItem
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.RouteLoopMode
 import com.novavm.app.data.VirtualLocationConfig
+import com.novavm.app.data.VirtualLocationMode
 import com.novavm.app.data.VmArchitecture
 import com.novavm.app.data.VmBackendType
 import com.novavm.app.data.VmHardwareConfig
@@ -22,6 +25,7 @@ import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.NativeEngine
 import com.novavm.app.engine.VmRuntimeState
 import com.novavm.app.location.GeoMath
+import com.novavm.app.location.RoutePlaybackState
 import com.novavm.app.transfer.SharedFileInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -98,6 +102,10 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
         )
     )
     val state: StateFlow<NovaUiState> = _state.asStateFlow()
+
+    /** Live route playback map, mirrored from the process-wide [RouteSimulator]. */
+    val routePlaybackStates: StateFlow<Map<String, RoutePlaybackState>> =
+        app.routeSimulator.playbackStates
 
     init {
         refresh()
@@ -274,6 +282,7 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
     fun deleteVm(vmId: String) {
         io {
             val removed = onDisk { app.vmInstanceManager.deleteProfile(vmId) }
+            if (removed) app.routeSimulator.forget(vmId)
             if (_state.value.selectedVmId == vmId) {
                 _state.update { it.copy(selectedVmId = null, sharedFiles = emptyList(), consoleLog = emptyList()) }
             }
@@ -472,6 +481,149 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
         var value = bearing % 360f
         if (value < 0f) value += 360f
         return value
+    }
+
+    // -------------------------------------------- map picking & route playback
+
+    /** Teleports the mock fix to a coordinate tapped on the interactive map. */
+    fun pickMapLocation(vmId: String, point: GeoPoint) {
+        io {
+            val found = mutateGps(vmId) { gps ->
+                gps.copy(
+                    enabled = true,
+                    latitude = GeoMath.clampLat(point.latitude),
+                    longitude = GeoMath.normalizeLon(point.longitude),
+                    presetName = "地图选点定位"
+                )
+            }
+            if (found) toast("已按地图选点更新定位")
+        }
+    }
+
+    /** Appends a waypoint tapped while in 规划路径 mode. */
+    fun addRouteWaypoint(vmId: String, point: GeoPoint) {
+        io {
+            val found = mutateGps(vmId) { gps ->
+                val waypoint = GeoPoint(
+                    latitude = GeoMath.clampLat(point.latitude),
+                    longitude = GeoMath.normalizeLon(point.longitude),
+                    altitude = gps.altitude,
+                    label = "途经点 ${gps.routeWaypoints.size + 1}"
+                )
+                gps.copy(
+                    enabled = true,
+                    mode = VirtualLocationMode.ROUTE_WALK,
+                    routeWaypoints = gps.routeWaypoints + waypoint
+                )
+            }
+            if (found) toast("已添加途经点")
+        }
+    }
+
+    fun removeRouteWaypoint(vmId: String, index: Int) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val waypoints = profile.virtualLocation.routeWaypoints
+            if (index !in waypoints.indices) {
+                toast("没有可删除的途经点", isError = true)
+                return@io
+            }
+            applyVirtualLocation(
+                profile,
+                profile.virtualLocation.copy(
+                    routeWaypoints = waypoints.filterIndexed { i, _ -> i != index }
+                )
+            )
+            toast("已移除途经点")
+        }
+    }
+
+    fun clearRouteWaypoints(vmId: String) {
+        io {
+            val found = mutateGps(vmId) { gps ->
+                gps.copy(
+                    routeWaypoints = emptyList(),
+                    mode = VirtualLocationMode.STATIC
+                )
+            }
+            if (found) {
+                app.routeSimulator.forget(vmId)
+                toast("路径已清空")
+            }
+        }
+    }
+
+    /** Six-point closed demo loop around the current fix, for one-tap testing. */
+    fun generateSampleRoute(vmId: String) {
+        io {
+            val found = mutateGps(vmId) { gps ->
+                gps.copy(
+                    enabled = true,
+                    mode = VirtualLocationMode.ROUTE_WALK,
+                    routeWaypoints = GeoMath.generateSampleLoopRoute(
+                        centerLat = gps.latitude,
+                        centerLon = gps.longitude,
+                        radiusMeters = 300.0
+                    )
+                )
+            }
+            if (found) {
+                app.routeSimulator.stopAndReset(vmId)
+                toast("已生成示例路线（6 个途经点）")
+            }
+        }
+    }
+
+    fun setRouteLoopMode(vmId: String, mode: RouteLoopMode) {
+        io {
+            val found = mutateGps(vmId) { it.copy(loopMode = mode) }
+            if (found) toast("循环模式已更新")
+        }
+    }
+
+    fun setRouteSpeed(vmId: String, speedMps: Float) {
+        io {
+            val found = mutateGps(vmId) {
+                it.copy(speedMps = speedMps.coerceIn(0.5f, 35f))
+            }
+            if (found) toast("模拟速度已更新")
+        }
+    }
+
+    fun startRouteSimulation(vmId: String) {
+        if (app.routeSimulator.start(vmId)) {
+            toast("路线模拟已开始")
+            refreshConsole(vmId)
+        } else {
+            toast("请先规划至少两个途经点", isError = true)
+        }
+    }
+
+    fun pauseRouteSimulation(vmId: String) {
+        val paused = app.routeSimulator.pause(vmId)
+        toast(if (paused) "路线模拟已暂停" else "当前没有正在播放的路线", isError = !paused)
+    }
+
+    fun resetRouteSimulation(vmId: String) {
+        app.routeSimulator.stopAndReset(vmId)
+        toast("路线模拟已重置")
+    }
+
+    private suspend fun mutateGps(
+        vmId: String,
+        transform: (VirtualLocationConfig) -> VirtualLocationConfig
+    ): Boolean {
+        val profile = onDisk { app.vmRepository.get(vmId) }
+        if (profile == null) {
+            toast("找不到该虚拟机", isError = true)
+            return false
+        }
+        applyVirtualLocation(profile, transform(profile.virtualLocation))
+        return true
     }
 
     // ------------------------------------------------------------- snapshots

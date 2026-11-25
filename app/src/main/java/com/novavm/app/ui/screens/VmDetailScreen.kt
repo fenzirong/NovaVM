@@ -3,7 +3,6 @@ package com.novavm.app.ui.screens
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,6 +30,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -47,6 +47,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ScrollableTabRow
@@ -59,18 +60,15 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -84,20 +82,25 @@ import com.novavm.app.data.GeoPoint
 import com.novavm.app.data.GpuMode
 import com.novavm.app.data.LocationPresets
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.RouteLoopMode
 import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VirtualLocationMode
 import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmStatus
+import com.novavm.app.location.GeoMath
+import com.novavm.app.location.MapTileSource
+import com.novavm.app.location.RoutePlaybackState
+import com.novavm.app.location.RouteSimulator
 import com.novavm.app.ui.NovaUiState
 import com.novavm.app.ui.NovaVmViewModel
+import com.novavm.app.ui.components.InteractiveGeoMap
+import com.novavm.app.ui.components.MapInteractionMode
 import com.novavm.app.ui.components.NovaTag
 import com.novavm.app.ui.components.StatusPill
 import com.novavm.app.ui.theme.NovaPalette
 import java.util.Locale
-import kotlin.math.cos
-import kotlin.math.hypot
-import kotlin.math.min
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private val detailTabs = listOf("硬件配置", "设备伪装", "虚拟定位", "Root 与 Xposed", "快照与日志")
@@ -739,12 +742,11 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
     var stepMeters by remember(profile.id) { mutableStateOf(20f) }
     var nmeaOpen by remember(profile.id) { mutableStateOf(false) }
     var copied by remember(profile.id) { mutableStateOf(false) }
+    var mapMode by remember(profile.id) { mutableStateOf(MapInteractionMode.PICK) }
+    var tileSource by remember(profile.id) { mutableStateOf(MapTileSource.AMAP) }
 
-    val sessionTrail = remember(profile.id) { mutableStateListOf<GeoPoint>() }
-    LaunchedEffect(gps.latitude, gps.longitude) {
-        sessionTrail.add(GeoPoint(gps.latitude, gps.longitude, gps.altitude, gps.presetName))
-        while (sessionTrail.size > 48) sessionTrail.removeAt(0)
-    }
+    val playbackStates by vm.routePlaybackStates.collectAsState()
+    val playback = playbackStates[profile.id]
 
     fun draft(): VirtualLocationConfig = VirtualLocationConfig(
         enabled = enabled,
@@ -757,11 +759,11 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
         bearingDegrees = gps.bearingDegrees,
         mode = mode,
         jitterEnabled = jitter,
-        routeWaypoints = gps.routeWaypoints
+        routeWaypoints = gps.routeWaypoints,
+        loopMode = gps.loopMode
     )
 
     val config = draft()
-    val trailPoints = sessionTrail.toList() + gps.routeWaypoints
     val clipboard = LocalClipboardManager.current
 
     Column(
@@ -799,7 +801,67 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
         }
 
         Spacer(Modifier.height(14.dp))
-        CoordinateRadar(config = config, trail = trailPoints)
+        InteractiveGeoMap(
+            resetKey = profile.id,
+            centerLat = config.latitude,
+            centerLon = config.longitude,
+            accuracyMeters = config.accuracyMeters,
+            routeWaypoints = config.routeWaypoints,
+            currentPoint = GeoPoint(
+                latitude = config.latitude,
+                longitude = config.longitude,
+                altitude = config.altitude,
+                label = config.presetName
+            ),
+            bearingDegrees = playback?.bearingDegrees ?: config.bearingDegrees,
+            interactionMode = mapMode,
+            tileSource = tileSource,
+            onInteractionModeChange = { mapMode = it },
+            onTileSourceChange = { tileSource = it },
+            onPickLocation = { point ->
+                enabled = true
+                presetName = "地图选点定位"
+                latText = formatCoordinate(point.latitude)
+                lonText = formatCoordinate(point.longitude)
+                vm.pickMapLocation(profile.id, point)
+            },
+            onAddWaypoint = { point ->
+                enabled = true
+                vm.addRouteWaypoint(profile.id, point)
+            }
+        )
+        Text(
+            text = "「选点定位」轻点地图立即传送；「规划路径」逐点添加途经点，" +
+                "支持双指缩放、拖动平移与离线网格。",
+            color = NovaPalette.TextMuted,
+            fontSize = 10.sp,
+            modifier = Modifier.padding(top = 8.dp)
+        )
+
+        Spacer(Modifier.height(14.dp))
+        RouteSimulationCard(
+            profile = profile,
+            playback = playback,
+            speedMps = config.speedMps,
+            onSpeedPreset = { metersPerSecond ->
+                speedText = String.format(Locale.US, "%.2f", metersPerSecond)
+                vm.setRouteSpeed(profile.id, metersPerSecond)
+            },
+            onSpeedCommit = { metersPerSecond ->
+                speedText = String.format(Locale.US, "%.2f", metersPerSecond)
+                vm.setRouteSpeed(profile.id, metersPerSecond)
+            },
+            onLoopMode = { loop -> vm.setRouteLoopMode(profile.id, loop) },
+            onUndo = {
+                vm.removeRouteWaypoint(profile.id, config.routeWaypoints.lastIndex)
+            },
+            onClear = { vm.clearRouteWaypoints(profile.id) },
+            onGenerate = { vm.generateSampleRoute(profile.id) },
+            onStart = { vm.startRouteSimulation(profile.id) },
+            onPause = { vm.pauseRouteSimulation(profile.id) },
+            onReset = { vm.resetRouteSimulation(profile.id) },
+            onRemoveWaypoint = { index -> vm.removeRouteWaypoint(profile.id, index) }
+        )
 
         Spacer(Modifier.height(14.dp))
         DetailFormCard("城市预设 · 一键传送") {
@@ -958,112 +1020,254 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
 }
 
 @Composable
-private fun CoordinateRadar(config: VirtualLocationConfig, trail: List<GeoPoint>) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(214.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(NovaPalette.Background)
-            .border(1.dp, NovaPalette.Border.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
-    ) {
-        Canvas(
+private fun RouteSimulationCard(
+    profile: VmProfile,
+    playback: RoutePlaybackState?,
+    speedMps: Float,
+    onSpeedPreset: (Float) -> Unit,
+    onSpeedCommit: (Float) -> Unit,
+    onLoopMode: (RouteLoopMode) -> Unit,
+    onUndo: () -> Unit,
+    onClear: () -> Unit,
+    onGenerate: () -> Unit,
+    onStart: () -> Unit,
+    onPause: () -> Unit,
+    onReset: () -> Unit,
+    onRemoveWaypoint: (Int) -> Unit
+) {
+    val gps = profile.virtualLocation
+    val waypoints = gps.routeWaypoints
+    val selectedSpeed = speedMps.coerceIn(0.5f, 35f)
+
+    DetailFormCard("路径模拟控制") {
+        Row(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(14.dp)
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            val center = Offset(size.width / 2f, size.height / 2f)
-            val radius = (min(size.width, size.height) / 2f - 4f).coerceAtLeast(24f)
-            val rangeMeters = 500.0
-
-            listOf(0.34f, 0.67f, 1f).forEach { factor ->
-                drawCircle(
-                    color = NovaPalette.Cyan.copy(alpha = 0.16f),
-                    radius = radius * factor,
-                    center = center,
-                    style = Stroke(width = 1.2f)
-                )
-            }
-            val crosshair = NovaPalette.Cyan.copy(alpha = 0.16f)
-            drawLine(crosshair, Offset(center.x - radius, center.y), Offset(center.x + radius, center.y), 1f)
-            drawLine(crosshair, Offset(center.x, center.y - radius), Offset(center.x, center.y + radius), 1f)
-
-            if (trail.size > 1) {
-                val path = Path()
-                trail.forEachIndexed { index, point ->
-                    val offset = projectToRadar(point, config, center, radius, rangeMeters)
-                    if (index == 0) path.moveTo(offset.x, offset.y) else path.lineTo(offset.x, offset.y)
-                }
-                drawPath(path, NovaPalette.Violet.copy(alpha = 0.65f), style = Stroke(width = 2f))
-            }
-            trail.forEach { point ->
-                drawCircle(
-                    color = NovaPalette.Violet.copy(alpha = 0.85f),
-                    radius = 2.6f,
-                    center = projectToRadar(point, config, center, radius, rangeMeters)
-                )
-            }
-
-            drawCircle(NovaPalette.Cyan.copy(alpha = 0.16f), 15f, center)
-            drawCircle(NovaPalette.Cyan.copy(alpha = 0.32f), 8f, center)
-            drawCircle(NovaPalette.Cyan, 4f, center)
+            NovaTag("途经点 ${waypoints.size}", NovaPalette.Cyan)
+            NovaTag(loopModeLabel(gps.loopMode), NovaPalette.Violet)
+            NovaTag(
+                text = if (playback?.isPlaying == true) "播放中" else "未播放",
+                color = if (playback?.isPlaying == true) NovaPalette.Emerald else NovaPalette.TextMuted
+            )
         }
 
-        Text(
-            text = "N",
-            color = NovaPalette.TextMuted,
-            fontSize = 9.sp,
-            fontFamily = FontFamily.Monospace,
+        Row(
             modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 3.dp)
-        )
-        Text(
-            text = "E",
-            color = NovaPalette.TextMuted,
-            fontSize = 9.sp,
-            fontFamily = FontFamily.Monospace,
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 4.dp)
-        )
-        Text(
-            text = "S",
-            color = NovaPalette.TextMuted,
-            fontSize = 9.sp,
-            fontFamily = FontFamily.Monospace,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 26.dp)
-        )
-        Text(
-            text = "W",
-            color = NovaPalette.TextMuted,
-            fontSize = 9.sp,
-            fontFamily = FontFamily.Monospace,
-            modifier = Modifier
-                .align(Alignment.CenterStart)
-                .padding(start = 4.dp)
-        )
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 5.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
+            CompactAction("撤销上一点", NovaPalette.TextSecondary, onUndo)
+            CompactAction("清空路径", NovaPalette.Coral, onClear)
+            CompactAction("生成示例路线", NovaPalette.Amber, onGenerate)
+        }
+
+        Text("速度预设", color = NovaPalette.TextSecondary, fontSize = 11.sp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            speedPresets.forEach { (label, metersPerSecond) ->
+                FilterChip(
+                    selected = abs(selectedSpeed - metersPerSecond) < 0.06f,
+                    onClick = { onSpeedPreset(metersPerSecond) },
+                    label = { Text(label, fontSize = 10.sp) },
+                    colors = detailChipColors()
+                )
+            }
+        }
+
+        var sliderSpeed by remember(profile.id, selectedSpeed) {
+            mutableStateOf(selectedSpeed)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("自定义速度", color = NovaPalette.TextSecondary, fontSize = 11.sp)
             Text(
-                text = config.presetName.ifBlank { "自定义坐标" },
-                color = NovaPalette.TextPrimary,
-                fontSize = 10.sp
-            )
-            Text(
-                text = "${formatCoordinate(config.latitude)}, ${formatCoordinate(config.longitude)}",
+                text = String.format(Locale.US, "%.1f m/s", sliderSpeed),
                 color = NovaPalette.Cyan,
-                fontSize = 9.sp,
+                fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace
             )
         }
+        Slider(
+            value = sliderSpeed,
+            onValueChange = { sliderSpeed = it },
+            onValueChangeFinished = { onSpeedCommit(sliderSpeed) },
+            valueRange = 0.5f..35f,
+            colors = SliderDefaults.colors(
+                thumbColor = NovaPalette.Cyan,
+                activeTrackColor = NovaPalette.Cyan,
+                inactiveTrackColor = NovaPalette.SurfaceMuted
+            )
+        )
+
+        Text("循环模式", color = NovaPalette.TextSecondary, fontSize = 11.sp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            RouteLoopMode.entries.forEach { loop ->
+                FilterChip(
+                    selected = gps.loopMode == loop,
+                    onClick = { onLoopMode(loop) },
+                    label = { Text(loopModeLabel(loop), fontSize = 10.sp) },
+                    colors = detailChipColors()
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Button(
+                onClick = onStart,
+                enabled = waypoints.size >= 2,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Cyan,
+                    contentColor = Color(0xFF04121C)
+                ),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("开始模拟", fontSize = 11.sp)
+            }
+            OutlinedButton(
+                onClick = onPause,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    Icons.Default.Pause,
+                    contentDescription = null,
+                    tint = NovaPalette.Amber,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text("暂停", color = NovaPalette.Amber, fontSize = 11.sp)
+            }
+            OutlinedButton(
+                onClick = onReset,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    Icons.Default.Refresh,
+                    contentDescription = null,
+                    tint = NovaPalette.TextSecondary,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text("重置", fontSize = 11.sp)
+            }
+        }
+
+        val totalMeters = playback?.takeIf { it.hasRoute }?.totalMeters
+            ?: GeoMath.totalRouteDistanceMeters(waypoints)
+        val progress = playback?.progressFraction ?: 0f
+        LinearProgressIndicator(
+            progress = { progress },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(RoundedCornerShape(999.dp)),
+            color = NovaPalette.Cyan,
+            trackColor = NovaPalette.SurfaceMuted
+        )
+        Text(
+            text = if (playback != null) {
+                RouteSimulator.progressText(playback)
+            } else {
+                String.format(
+                    Locale.US,
+                    "已行进 0m / 总长 %.0fm · 航向 %.0f°",
+                    totalMeters,
+                    gps.bearingDegrees
+                )
+            },
+            color = NovaPalette.TextSecondary,
+            fontSize = 10.sp,
+            fontFamily = FontFamily.Monospace
+        )
+
+        if (waypoints.isEmpty()) {
+            Text(
+                text = "尚未规划路径。切换到「规划路径」在地图上点选，或点击「生成示例路线」。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+        } else {
+            waypoints.forEachIndexed { index, waypoint ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "${index + 1}",
+                        color = NovaPalette.Cyan,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.width(18.dp)
+                    )
+                    Text(
+                        text = "${formatCoordinate(waypoint.latitude)}, " +
+                            formatCoordinate(waypoint.longitude),
+                        color = NovaPalette.TextPrimary,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = { onRemoveWaypoint(index) },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "删除第 ${index + 1} 个途经点",
+                            tint = NovaPalette.Coral,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+            }
+        }
     }
+}
+
+private val speedPresets: List<Pair<String, Float>> = listOf(
+    "步行 5km/h" to 1.4f,
+    "跑步 11km/h" to 3.0f,
+    "骑行 20km/h" to 5.5f,
+    "驾车 60km/h" to 16.7f
+)
+
+@Composable
+private fun CompactAction(label: String, color: Color, onClick: () -> Unit) {
+    Text(
+        text = label,
+        color = color,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(color.copy(alpha = 0.12f))
+            .border(1.dp, color.copy(alpha = 0.30f), RoundedCornerShape(9.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 9.dp, vertical = 5.dp)
+    )
 }
 
 @Composable
@@ -1121,32 +1325,16 @@ private fun GpsPadButton(label: String, arrow: String, onClick: () -> Unit) {
     }
 }
 
-private fun projectToRadar(
-    point: GeoPoint,
-    origin: VirtualLocationConfig,
-    center: Offset,
-    radius: Float,
-    rangeMeters: Double
-): Offset {
-    val north = (point.latitude - origin.latitude) * 111_320.0
-    val east = (point.longitude - origin.longitude) * 111_320.0 *
-        cos(Math.toRadians(origin.latitude))
-    val scale = radius / rangeMeters
-    var dx = east * scale
-    var dy = -north * scale
-    val length = hypot(dx, dy)
-    if (length > radius) {
-        val factor = radius / length
-        dx *= factor
-        dy *= factor
-    }
-    return Offset((center.x + dx).toFloat(), (center.y + dy).toFloat())
-}
-
 private fun modeLabel(mode: VirtualLocationMode): String = when (mode) {
     VirtualLocationMode.STATIC -> "定点"
     VirtualLocationMode.ROUTE_WALK -> "轨迹"
     VirtualLocationMode.JOYSTICK -> "摇杆"
+}
+
+private fun loopModeLabel(mode: RouteLoopMode): String = when (mode) {
+    RouteLoopMode.ONCE -> "单次到达"
+    RouteLoopMode.LOOP -> "首尾循环"
+    RouteLoopMode.PING_PONG -> "往返折返"
 }
 
 private fun formatCoordinate(value: Double): String =
