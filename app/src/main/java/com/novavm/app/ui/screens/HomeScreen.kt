@@ -369,11 +369,11 @@ private fun VmInstanceCard(
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 NovaTag(
-                    text = if (profile.rootXposed.rootEnabled) "ROOT" else "NO ROOT",
+                    text = if (profile.rootXposed.rootEnabled) "ROOT" else "未 Root",
                     color = if (profile.rootXposed.rootEnabled) NovaPalette.Emerald else NovaPalette.TextMuted
                 )
                 NovaTag(
-                    text = if (profile.rootXposed.xposedEnabled) "LSPOSED" else "XPOSED OFF",
+                    text = if (profile.rootXposed.xposedEnabled) "LSPOSED" else "Xposed 关闭",
                     color = if (profile.rootXposed.xposedEnabled) NovaPalette.Cyan else NovaPalette.TextMuted
                 )
                 NovaTag(

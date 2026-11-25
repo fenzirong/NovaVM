@@ -100,7 +100,7 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-private val detailTabs = listOf("硬件配置", "设备伪装", "虚拟定位", "Root & Xposed", "快照与日志")
+private val detailTabs = listOf("硬件配置", "设备伪装", "虚拟定位", "Root 与 Xposed", "快照与日志")
 
 @Composable
 fun VmDetailScreen(
@@ -420,7 +420,7 @@ private fun SpoofTab(profile: VmProfile, vm: NovaVmViewModel) {
             DetailTextField("IMEI", imei) { imei = it }
             DetailTextField("Android ID", androidId) { androidId = it }
             DetailTextField("WiFi MAC", wifiMac) { wifiMac = it }
-            DetailTextField("Build Fingerprint", fingerprint) { fingerprint = it }
+            DetailTextField("构建指纹 (Build Fingerprint)", fingerprint) { fingerprint = it }
             Text(
                 text = "字段将写入 novavm_boot.sh 的 resetprop 指令并同步到 QEMU SMBIOS。",
                 color = NovaPalette.TextMuted,
@@ -484,7 +484,7 @@ private fun RootTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel)
         DetailFormCard("权限开关") {
             DetailToggle("Root (Magisk / su)", rootEnabled) { rootEnabled = it }
             DetailToggle("Xposed / LSPosed", xposedEnabled) { xposedEnabled = it }
-            DetailToggle("SELinux Permissive", selinux) { selinux = it }
+            DetailToggle("SELinux 宽容模式 (Permissive)", selinux) { selinux = it }
             DetailToggle("MagiskHide", magiskHide) { magiskHide = it }
             Button(
                 onClick = {
@@ -628,7 +628,7 @@ private fun SnapshotLogTab(profile: VmProfile, state: NovaUiState, vm: NovaVmVie
                                 fontSize = 13.sp
                             )
                             Text(
-                                text = "id ${snapshot.id.take(8)}",
+                                text = "ID ${snapshot.id.take(8)}",
                                 color = NovaPalette.TextMuted,
                                 fontSize = 9.sp,
                                 fontFamily = FontFamily.Monospace
@@ -781,7 +781,7 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 NovaTag(
-                    text = if (enabled) "GPS ON" else "GPS OFF",
+                    text = if (enabled) "GPS 已开启" else "GPS 已关闭",
                     color = if (enabled) NovaPalette.Emerald else NovaPalette.TextMuted
                 )
                 NovaTag(modeLabel(mode), NovaPalette.Cyan)
@@ -791,7 +791,7 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
             Text(
                 text = "${presetName.ifBlank { "自定义坐标" }} · " +
                     "${formatCoordinate(config.latitude)}, ${formatCoordinate(config.longitude)} · " +
-                    "alt ${String.format(Locale.US, "%.1f", config.altitude)}m",
+                    "海拔 ${String.format(Locale.US, "%.1f", config.altitude)}m",
                 color = NovaPalette.TextSecondary,
                 fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace

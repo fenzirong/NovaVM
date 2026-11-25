@@ -118,7 +118,7 @@ class VmDisplayActivity : ComponentActivity() {
     private var isInPip by mutableStateOf(false)
     private var hudVisible by mutableStateOf(true)
     private var measuredFps by mutableStateOf(0)
-    private var sourceLabel by mutableStateOf("BOOT CONSOLE")
+    private var sourceLabel by mutableStateOf("启动控制台")
     private var backendLabel by mutableStateOf("QEMU")
     private var paused by mutableStateOf(false)
 
@@ -168,6 +168,7 @@ class VmDisplayActivity : ComponentActivity() {
         )
         display.console.appendLine("[ OK ] display attached: ${loaded.hardware.width}x${loaded.hardware.height} @ ${loaded.hardware.targetFps}fps")
         display.console.appendLine("[ .. ] RFB ${VmDisplayPipeline.HOST}:${loaded.vncPort} / ${loaded.architecture.name} ${loaded.backendType.name}")
+        // Bitmap console font is ASCII-only, so the footer hint stays Latin.
         display.console.footerHint = "Tap to interact  |  VNC ${VmDisplayPipeline.HOST}:${loaded.vncPort}"
         display.console.setProgress(0.4f)
         pipeline = display
@@ -180,7 +181,7 @@ class VmDisplayActivity : ComponentActivity() {
                 val current = pipeline
                 if (current != null) {
                     measuredFps = current.measuredFps
-                    sourceLabel = if (current.source == VmDisplayPipeline.Source.RFB) "GUEST RFB" else "BOOT CONSOLE"
+                    sourceLabel = if (current.source == VmDisplayPipeline.Source.RFB) "客户机 RFB" else "启动控制台"
                     backendLabel = application.vmInstanceManager.state(loaded.id)?.backendName
                         ?: loaded.backendType.name
                     paused = application.vmInstanceManager.state(loaded.id)?.status ==
@@ -608,7 +609,7 @@ private fun VmDisplayScreen(
             ) {
                 Icon(
                     imageVector = if (hudVisible) Icons.Default.KeyboardArrowDown else Icons.Default.Menu,
-                    contentDescription = "HUD",
+                    contentDescription = "控制面板",
                     tint = NovaPalette.Cyan,
                     modifier = Modifier.size(22.dp)
                 )

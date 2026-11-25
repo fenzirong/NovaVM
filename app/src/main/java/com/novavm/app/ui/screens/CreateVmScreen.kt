@@ -391,7 +391,7 @@ fun CreateVmScreen(
             FormCard(title = "Root 与 Xposed") {
                 ToggleRow("Root 权限 (Magisk / su)", rootEnabled) { rootEnabled = it }
                 ToggleRow("Xposed / LSPosed 框架", xposedEnabled) { xposedEnabled = it }
-                ToggleRow("SELinux Permissive", selinuxPermissive) { selinuxPermissive = it }
+                ToggleRow("SELinux 宽容模式 (Permissive)", selinuxPermissive) { selinuxPermissive = it }
                 ToggleRow("MagiskHide 隐藏 Root", magiskHide) { magiskHide = it }
             }
         }
