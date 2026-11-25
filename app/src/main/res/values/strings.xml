@@ -1,4 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">NovaVM</string>
+    <string name="app_tagline">全系统 Android 虚拟机</string>
+
+    <string name="notif_channel_floating">悬浮虚拟机窗口</string>
+    <string name="notif_channel_floating_desc">在其它应用之上显示正在运行的虚拟机</string>
+    <string name="floating_notification_title">NovaVM 悬浮虚拟机</string>
+    <string name="floating_notification_text">虚拟机正在后台运行</string>
+    <string name="floating_close">关闭</string>
+
+    <string name="tab_instances">虚拟机</string>
+    <string name="tab_roms">镜像库</string>
+    <string name="tab_transfer">文件互传</string>
+
+    <string name="action_create_vm">创建虚拟机</string>
+    <string name="action_quick_create">一键创建</string>
+    <string name="action_start">启动</string>
+    <string name="action_stop">停止</string>
+    <string name="action_open_fullscreen">全屏显示</string>
+    <string name="action_floating_window">悬浮窗</string>
+    <string name="action_settings">设置</string>
+    <string name="action_clone">克隆</string>
+    <string name="action_delete">删除</string>
+
+    <string name="label_host_capabilities">宿主虚拟化能力</string>
+    <string name="label_picture_in_picture">画中画</string>
+    <string name="label_power_off">关机</string>
+    <string name="overlay_permission_hint">需要悬浮窗权限才能在其他应用上显示虚拟机</string>
 </resources>
