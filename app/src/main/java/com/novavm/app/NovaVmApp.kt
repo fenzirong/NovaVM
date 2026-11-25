@@ -13,6 +13,7 @@ import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmRepository
 import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.VmInstanceManager
+import com.novavm.app.location.VirtualGpsEngine
 import com.novavm.app.root.RootXposedConfigurator
 import com.novavm.app.transfer.HostGuestTransferManager
 import java.io.File
@@ -39,10 +40,14 @@ class NovaVmApp : Application() {
 
     val romRepository: RomRepository by lazy { RomRepository(storageRoot) }
 
+    /** Mock GPS renderer shared by the ViewModel, the display HUD and tests. */
+    val virtualGpsEngine: VirtualGpsEngine by lazy { VirtualGpsEngine() }
+
     val vmInstanceManager: VmInstanceManager by lazy {
         VmInstanceManager(
             repository = vmRepository,
-            capabilitiesProvider = { hostCapabilities }
+            capabilitiesProvider = { hostCapabilities },
+            virtualGps = virtualGpsEngine
         ).also { manager ->
             runCatching { manager.refresh() }
         }

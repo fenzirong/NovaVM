@@ -2,6 +2,7 @@ package com.novavm.app.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -54,7 +56,9 @@ import androidx.compose.ui.unit.sp
 import com.novavm.app.data.DevicePresets
 import com.novavm.app.data.DeviceSpoofGenerator
 import com.novavm.app.data.GpuMode
+import com.novavm.app.data.LocationPresets
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VmArchitecture
 import com.novavm.app.data.VmBackendType
 import com.novavm.app.data.VmHardwareConfig
@@ -95,6 +99,9 @@ fun CreateVmScreen(
     var xposedEnabled by remember { mutableStateOf(true) }
     var selinuxPermissive by remember { mutableStateOf(false) }
     var magiskHide by remember { mutableStateOf(true) }
+
+    var gpsEnabled by remember { mutableStateOf(false) }
+    var gpsPreset by remember { mutableStateOf(LocationPresets.beijingTiananmen) }
 
     val resolutions = listOf(
         720 to 1280,
@@ -348,6 +355,39 @@ fun CreateVmScreen(
         }
 
         item {
+            FormCard(title = "虚拟定位 (Mock GPS)") {
+                ToggleRow("启用虚拟定位", gpsEnabled) { gpsEnabled = it }
+                Spacer(Modifier.height(8.dp))
+                FieldLabel("预设城市")
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    LocationPresets.all.forEach { preset ->
+                        FilterChip(
+                            selected = gpsPreset.presetName == preset.presetName,
+                            onClick = { gpsPreset = preset },
+                            label = { Text(preset.presetName, fontSize = 11.sp) },
+                            colors = chipColors()
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = String.format(
+                        java.util.Locale.US,
+                        "%.4f, %.4f  ·  NMEA + apply_location.sh 随 VM 生成",
+                        gpsPreset.latitude,
+                        gpsPreset.longitude
+                    ),
+                    color = NovaPalette.TextMuted,
+                    fontSize = 9.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+
+        item {
             FormCard(title = "Root 与 Xposed") {
                 ToggleRow("Root 权限 (Magisk / su)", rootEnabled) { rootEnabled = it }
                 ToggleRow("Xposed / LSPosed 框架", xposedEnabled) { xposedEnabled = it }
@@ -382,6 +422,13 @@ fun CreateVmScreen(
                                 xposedEnabled = xposedEnabled,
                                 selinuxPermissive = selinuxPermissive,
                                 magiskHideEnabled = magiskHide
+                            ),
+                            virtualLocation = VirtualLocationConfig(
+                                enabled = gpsEnabled,
+                                presetName = gpsPreset.presetName,
+                                latitude = gpsPreset.latitude,
+                                longitude = gpsPreset.longitude,
+                                altitude = gpsPreset.altitude
                             )
                         ),
                         onCreated = onCreated

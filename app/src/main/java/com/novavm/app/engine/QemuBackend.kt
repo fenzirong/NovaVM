@@ -5,6 +5,7 @@ import com.novavm.app.data.VmArchitecture
 import com.novavm.app.data.VmBackendType
 import com.novavm.app.data.VmProfile
 import java.io.File
+import java.util.Locale
 
 /**
  * Builds a complete QEMU system-emulator command line for a VM profile.
@@ -12,7 +13,7 @@ import java.io.File
  * The generated argv is deliberately deterministic so it can be asserted in
  * unit tests and logged verbatim when a launch fails.
  */
-class QemuBackend : VmBackend {
+class QemuBackend(private val logger: (String) -> Unit = {}) : VmBackend {
 
     override val backendName: String = "QEMU"
 
@@ -115,7 +116,32 @@ class QemuBackend : VmBackend {
         args += listOf("-rtc", "base=utc")
         args += listOf("-no-reboot")
 
+        // Virtual location status is logged before every launch so the console
+        // shows whether a mock GPS fix will reach the guest.
+        val gps = profile.virtualLocation
+        if (gps.enabled) {
+            logger(
+                "virtual GPS enabled (${gps.mode.name.lowercase(Locale.US)}): " +
+                    "${gps.presetName} ${coordinate(gps.latitude)}, ${coordinate(gps.longitude)} " +
+                    "alt ${coordinate(gps.altitude)}m"
+            )
+        } else {
+            logger("virtual GPS disabled; guest keeps its real location provider")
+        }
+
         return args
+    }
+
+    /** androidboot/novavm kernel arguments for the mock GPS contract. */
+    fun gpsKernelArgs(profile: VmProfile): List<String> {
+        val gps = profile.virtualLocation
+        if (!gps.enabled) return emptyList()
+        return listOf(
+            "androidboot.novavm.gps=1",
+            "novavm.gps.lat=${coordinate(gps.latitude)}",
+            "novavm.gps.lon=${coordinate(gps.longitude)}",
+            "novavm.gps.alt=${coordinate(gps.altitude)}"
+        )
     }
 
     /** `-device` arguments matching the requested GPU emulation mode. */
@@ -160,9 +186,13 @@ class QemuBackend : VmBackend {
             add("androidboot.novavm.dpi=${hardware.dpi}")
             add("androidboot.novavm.fps=${hardware.targetFps}")
             add("novavm.gpu=${hardware.gpuMode.name.lowercase()}")
+            addAll(gpsKernelArgs(profile))
             add("qemu=1")
         }.joinToString(" ")
     }
+
+    /** Locale-stable fixed-point rendering that never emits a comma. */
+    fun coordinate(value: Double): String = String.format(Locale.US, "%.6f", value)
 
     /**
      * QEMU option values split on commas, so literal commas are doubled.

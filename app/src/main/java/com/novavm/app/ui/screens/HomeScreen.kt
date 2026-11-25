@@ -380,6 +380,9 @@ private fun VmInstanceCard(
                     text = if (profile.deviceSpoof.enabled) profile.deviceSpoof.presetName else "原厂指纹",
                     color = NovaPalette.Amber
                 )
+                if (profile.virtualLocation.enabled) {
+                    NovaTag(text = "GPS", color = NovaPalette.Emerald)
+                }
             }
 
             Spacer(Modifier.height(14.dp))

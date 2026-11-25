@@ -2,12 +2,14 @@ package com.novavm.app.root
 
 import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmRepository
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 
 /**
  * Generates the guest-side bootstrap that applies device spoofing, root and
@@ -53,7 +55,8 @@ class RootXposedConfigurator(private val vmDir: File) {
         config: RootXposedConfig,
         spoof: DeviceSpoofConfig,
         hardware: VmHardwareConfig = VmHardwareConfig(),
-        profileName: String = ""
+        profileName: String = "",
+        virtualLocation: VirtualLocationConfig = VirtualLocationConfig()
     ): String = buildString {
         appendLine("#!/system/bin/sh")
         appendLine("# ------------------------------------------------------------------")
@@ -139,6 +142,26 @@ class RootXposedConfigurator(private val vmDir: File) {
             appendLine("")
         }
 
+        if (virtualLocation.enabled) {
+            appendLine("# --- Virtual location (mock GPS) ---")
+            appendLine("resetprop persist.novavm.gps.enabled 1")
+            appendLine("resetprop persist.novavm.gps.lat \"${coordinate(virtualLocation.latitude)}\"")
+            appendLine("resetprop persist.novavm.gps.lon \"${coordinate(virtualLocation.longitude)}\"")
+            appendLine("resetprop persist.novavm.gps.alt \"${coordinate(virtualLocation.altitude)}\"")
+            appendLine("resetprop persist.novavm.gps.mode \"${virtualLocation.mode.name.lowercase(Locale.US)}\"")
+            appendLine("GPS_SCRIPT=\"$GUEST_STAGE_DIR/apply_location.sh\"")
+            appendLine("[ -f \"\$GPS_SCRIPT\" ] || GPS_SCRIPT=\"/mnt/novavm_share/apply_location.sh\"")
+            appendLine("if [ -f \"\$GPS_SCRIPT\" ]; then")
+            appendLine("  /system/bin/sh \"\$GPS_SCRIPT\" || log -t novavm \"apply_location.sh failed\"")
+            appendLine("else")
+            appendLine("  log -t novavm \"apply_location.sh missing; NMEA not injected\"")
+            appendLine("fi")
+            appendLine("")
+        } else {
+            appendLine("# Virtual location disabled; no mock GPS properties are set.")
+            appendLine("")
+        }
+
         if (config.selinuxPermissive) {
             appendLine("# --- SELinux ---")
             appendLine("setenforce 0")
@@ -158,7 +181,8 @@ class RootXposedConfigurator(private val vmDir: File) {
         config: RootXposedConfig,
         spoof: DeviceSpoofConfig,
         hardware: VmHardwareConfig = VmHardwareConfig(),
-        profileName: String = ""
+        profileName: String = "",
+        virtualLocation: VirtualLocationConfig = VirtualLocationConfig()
     ): String = buildString {
         appendLine("# ------------------------------------------------------------------")
         appendLine("# NovaVM init service (generated, do not edit)")
@@ -204,6 +228,11 @@ class RootXposedConfigurator(private val vmDir: File) {
         if (config.rootEnabled) {
             appendLine("    setprop persist.novavm.root 1")
         }
+        if (virtualLocation.enabled) {
+            appendLine("    setprop persist.novavm.gps.enabled 1")
+            appendLine("    setprop persist.novavm.gps.lat ${coordinate(virtualLocation.latitude)}")
+            appendLine("    setprop persist.novavm.gps.lon ${coordinate(virtualLocation.longitude)}")
+        }
     }
 
     /** Writes both generated files and returns them in write order. */
@@ -211,16 +240,17 @@ class RootXposedConfigurator(private val vmDir: File) {
         config: RootXposedConfig,
         spoof: DeviceSpoofConfig,
         hardware: VmHardwareConfig = VmHardwareConfig(),
-        profileName: String = ""
+        profileName: String = "",
+        virtualLocation: VirtualLocationConfig = VirtualLocationConfig()
     ): List<File> {
         ensureDirectories()
         bootScriptFile.writeText(
-            buildBootScript(config, spoof, hardware, profileName),
+            buildBootScript(config, spoof, hardware, profileName, virtualLocation),
             StandardCharsets.UTF_8
         )
         bootScriptFile.setExecutable(true, false)
         initRcFile.writeText(
-            buildInitRc(config, spoof, hardware, profileName),
+            buildInitRc(config, spoof, hardware, profileName, virtualLocation),
             StandardCharsets.UTF_8
         )
         return listOf(bootScriptFile, initRcFile)
@@ -292,4 +322,7 @@ class RootXposedConfigurator(private val vmDir: File) {
     }
 
     private fun escape(value: String): String = value.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    /** Locale-stable fixed-point coordinate for generated shell scripts. */
+    private fun coordinate(value: Double): String = String.format(Locale.US, "%.6f", value)
 }

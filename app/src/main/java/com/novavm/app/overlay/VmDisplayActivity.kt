@@ -20,6 +20,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
@@ -46,6 +47,7 @@ import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureInPictureAlt
@@ -85,12 +87,15 @@ import com.novavm.app.MainActivity
 import com.novavm.app.NovaVmApp
 import com.novavm.app.data.VmProfile
 import com.novavm.app.engine.RfbProtocol
+import com.novavm.app.location.GeoMath
 import com.novavm.app.ui.components.NovaTag
 import com.novavm.app.ui.theme.NovaPalette
 import com.novavm.app.ui.theme.NovaVmTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -117,6 +122,11 @@ class VmDisplayActivity : ComponentActivity() {
     private var backendLabel by mutableStateOf("QEMU")
     private var paused by mutableStateOf(false)
 
+    // Floating GPS joystick state, mirrored into Compose so nudges repaint live.
+    private var gpsPadVisible by mutableStateOf(false)
+    private var gpsLatitude by mutableStateOf(0.0)
+    private var gpsLongitude by mutableStateOf(0.0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val application = application as NovaVmApp
@@ -134,6 +144,9 @@ class VmDisplayActivity : ComponentActivity() {
         }
         profile = loaded
         application.setActiveVm(loaded.id)
+        gpsLatitude = loaded.virtualLocation.latitude
+        gpsLongitude = loaded.virtualLocation.longitude
+        gpsPadVisible = loaded.virtualLocation.enabled
 
         val runtime = application.vmInstanceManager.state(loaded.id)
         if (runtime?.isRunning != true) {
@@ -195,7 +208,12 @@ class VmDisplayActivity : ComponentActivity() {
                     paused = paused,
                     isInPip = isInPip,
                     hudVisible = hudVisible,
+                    gpsPadVisible = gpsPadVisible,
+                    gpsLatitude = gpsLatitude,
+                    gpsLongitude = gpsLongitude,
                     onToggleHud = { hudVisible = !hudVisible },
+                    onToggleGpsPad = { gpsPadVisible = !gpsPadVisible },
+                    onGpsNudge = { bearing -> nudgeGps(bearing) },
                     onPauseResume = { togglePause() },
                     onSnapshot = { takeSnapshot() },
                     onNavBack = { sendKeysym(RfbProtocol.KEYSYM_ESCAPE) },
@@ -337,6 +355,60 @@ class VmDisplayActivity : ComponentActivity() {
         finishAndRemoveTask()
     }
 
+    /**
+     * Moves the mock GPS fix by one joystick step and re-syncs the guest NMEA
+     * files, so the VM screen reflects the new position without leaving the HUD.
+     */
+    private fun nudgeGps(bearingDegrees: Double) {
+        val loaded = profile ?: return
+        val application = app ?: return
+        lifecycleScope.launch(Dispatchers.IO) {
+            val current = runCatching { application.vmRepository.get(loaded.id) }
+                .getOrNull() ?: return@launch
+            val gps = current.virtualLocation
+            val point = GeoMath.stepPosition(
+                gps.latitude,
+                gps.longitude,
+                bearingDegrees,
+                GPS_STEP_METERS
+            )
+            val updated = current.copy(
+                virtualLocation = gps.copy(
+                    enabled = true,
+                    latitude = point.latitude,
+                    longitude = point.longitude,
+                    bearingDegrees = bearingDegrees.toFloat()
+                )
+            )
+            runCatching { application.vmRepository.update(updated) }
+            runCatching {
+                application.rootXposedConfiguratorFor(loaded.id).writeAll(
+                    updated.rootXposed,
+                    updated.deviceSpoof,
+                    updated.hardware,
+                    updated.name,
+                    updated.virtualLocation
+                )
+            }
+            application.vmInstanceManager.syncVirtualLocation(loaded.id, "display-joystick")
+            withContext(Dispatchers.Main) {
+                profile = updated
+                gpsLatitude = point.latitude
+                gpsLongitude = point.longitude
+                pipeline?.appendConsole(
+                    String.format(
+                        Locale.US,
+                        "[GPS] joystick b%.0f +%.0fm -> %.6f, %.6f",
+                        bearingDegrees,
+                        GPS_STEP_METERS,
+                        point.latitude,
+                        point.longitude
+                    )
+                )
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- input
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -360,6 +432,9 @@ class VmDisplayActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_VM_ID = "com.novavm.app.extra.VM_ID"
+
+        /** One D-Pad tap distance on the display HUD joystick. */
+        const val GPS_STEP_METERS = 50.0
     }
 }
 
@@ -375,7 +450,12 @@ private fun VmDisplayScreen(
     paused: Boolean,
     isInPip: Boolean,
     hudVisible: Boolean,
+    gpsPadVisible: Boolean,
+    gpsLatitude: Double,
+    gpsLongitude: Double,
     onToggleHud: () -> Unit,
+    onToggleGpsPad: () -> Unit,
+    onGpsNudge: (Double) -> Unit,
     onPauseResume: () -> Unit,
     onSnapshot: () -> Unit,
     onNavBack: () -> Unit,
@@ -488,7 +568,19 @@ private fun VmDisplayScreen(
                     onPip = onPip,
                     onFloating = onFloating,
                     onTransfer = onTransfer,
-                    onPower = onPower
+                    onPower = onPower,
+                    gpsPadVisible = gpsPadVisible,
+                    onToggleGpsPad = onToggleGpsPad
+                )
+            }
+        }
+
+        if (gpsPadVisible && !isInPip) {
+            Box(Modifier.align(Alignment.BottomEnd)) {
+                GpsQuickJoystick(
+                    latitude = gpsLatitude,
+                    longitude = gpsLongitude,
+                    onNudge = onGpsNudge
                 )
             }
         }
@@ -601,7 +693,9 @@ private fun HudBottomBar(
     onPip: () -> Unit,
     onFloating: () -> Unit,
     onTransfer: () -> Unit,
-    onPower: () -> Unit
+    onPower: () -> Unit,
+    gpsPadVisible: Boolean,
+    onToggleGpsPad: () -> Unit
 ) {
     Row(
         modifier = Modifier
@@ -620,8 +714,85 @@ private fun HudBottomBar(
         HudNavItem(Icons.AutoMirrored.Filled.VolumeDown, "音量-", NovaPalette.TextSecondary, onVolumeDown)
         HudNavItem(Icons.Default.PictureInPictureAlt, "画中画", NovaPalette.Cyan, onPip)
         HudNavItem(Icons.AutoMirrored.Filled.OpenInNew, "悬浮窗", NovaPalette.Violet, onFloating)
+        HudNavItem(
+            icon = Icons.Default.MyLocation,
+            label = "定位摇杆",
+            tint = if (gpsPadVisible) NovaPalette.Amber else NovaPalette.TextSecondary,
+            onClick = onToggleGpsPad
+        )
         HudNavItem(Icons.Default.SwapHoriz, "互传", NovaPalette.Emerald, onTransfer)
         HudNavItem(Icons.Default.PowerSettingsNew, "关机", NovaPalette.Coral, onPower)
+    }
+}
+
+@Composable
+private fun GpsQuickJoystick(
+    latitude: Double,
+    longitude: Double,
+    onNudge: (Double) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .padding(end = 10.dp, bottom = 92.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(NovaPalette.SurfaceElevated.copy(alpha = 0.94f))
+            .border(1.dp, NovaPalette.Amber.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+            .padding(horizontal = 8.dp, vertical = 7.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "GPS 摇杆",
+            color = NovaPalette.Amber,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Text(
+            text = String.format(Locale.US, "%.5f, %.5f", latitude, longitude),
+            color = NovaPalette.TextSecondary,
+            fontSize = 8.sp,
+            fontFamily = FontFamily.Monospace
+        )
+        Spacer(Modifier.height(5.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            GpsPadKey("↖") { onNudge(315.0) }
+            GpsPadKey("↑") { onNudge(0.0) }
+            GpsPadKey("↗") { onNudge(45.0) }
+        }
+        Spacer(Modifier.height(3.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            GpsPadKey("←") { onNudge(270.0) }
+            Text(
+                text = "50m",
+                color = NovaPalette.Cyan,
+                fontSize = 8.sp,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.padding(horizontal = 5.dp)
+            )
+            GpsPadKey("→") { onNudge(90.0) }
+        }
+        Spacer(Modifier.height(3.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            GpsPadKey("↙") { onNudge(225.0) }
+            GpsPadKey("↓") { onNudge(180.0) }
+            GpsPadKey("↘") { onNudge(135.0) }
+        }
+    }
+}
+
+@Composable
+private fun GpsPadKey(arrow: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(NovaPalette.SurfaceMuted)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text = arrow, color = NovaPalette.Cyan, fontSize = 13.sp)
     }
 }
 

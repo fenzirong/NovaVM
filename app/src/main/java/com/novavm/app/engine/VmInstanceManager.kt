@@ -3,6 +3,7 @@ package com.novavm.app.engine
 import com.novavm.app.data.DevicePresets
 import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VmArchitecture
 import com.novavm.app.data.VmBackendType
 import com.novavm.app.data.VmHardwareConfig
@@ -10,6 +11,8 @@ import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmRepository
 import com.novavm.app.data.VmSnapshot
 import com.novavm.app.data.VmStatus
+import com.novavm.app.location.GpsSyncResult
+import com.novavm.app.location.VirtualGpsEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -48,6 +51,7 @@ class VmInstanceManager(
     private val capabilitiesProvider: () -> HostCapabilities = { HostCapabilities.conservative() },
     private val qemuBackend: QemuBackend = QemuBackend(),
     private val avfBackend: AvfBackend = AvfBackend(qemuBackend),
+    private val virtualGps: VirtualGpsEngine = VirtualGpsEngine(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val consoleLimit: Int = 400
 ) {
@@ -56,6 +60,9 @@ class VmInstanceManager(
     private val runtime = LinkedHashMap<String, VmRuntimeState>()
     private val logs = LinkedHashMap<String, ArrayDeque<String>>()
     private val launchCommands = LinkedHashMap<String, List<String>>()
+
+    /** Last logged GPS fix per VM, so unchanged coordinates do not spam logs. */
+    private val gpsFixes = LinkedHashMap<String, String>()
 
     private val _states = MutableStateFlow<List<VmRuntimeState>>(emptyList())
     val states: StateFlow<List<VmRuntimeState>> = _states.asStateFlow()
@@ -101,6 +108,7 @@ class VmInstanceManager(
             known.forEach { runtime[it.vmId] = it }
             logs.keys.retainAll(profiles.map { it.id }.toSet())
             launchCommands.keys.retainAll(profiles.map { it.id }.toSet())
+            gpsFixes.keys.retainAll(profiles.map { it.id }.toSet())
             _states.value = known
             return known
         }
@@ -154,7 +162,8 @@ class VmInstanceManager(
         backendType: VmBackendType = VmBackendType.AUTO,
         hardware: VmHardwareConfig = VmHardwareConfig(),
         deviceSpoof: DeviceSpoofConfig = DevicePresets.pixel8Pro,
-        rootXposed: RootXposedConfig = RootXposedConfig()
+        rootXposed: RootXposedConfig = RootXposedConfig(),
+        virtualLocation: VirtualLocationConfig = VirtualLocationConfig()
     ): VmProfile {
         val id = UUID.randomUUID().toString()
         repository.ensureVmDirectories(id)
@@ -169,6 +178,7 @@ class VmInstanceManager(
             hardware = hardware,
             deviceSpoof = deviceSpoof,
             rootXposed = rootXposed,
+            virtualLocation = virtualLocation,
             createdAtEpochMs = clock()
         )
         return synchronized(lock) {
@@ -183,6 +193,10 @@ class VmInstanceManager(
             )
             logs[stored.id] = ArrayDeque()
             appendConsole(stored.id, "VM profile created (${stored.architecture}, ${stored.hardware.cpuCores} vCPU, ${stored.hardware.ramMb} MB)")
+            if (stored.virtualLocation.enabled) {
+                appendConsole(stored.id, "[GPS] virtual location armed: ${stored.virtualLocation.presetName}")
+                syncVirtualLocation(stored.id, reason = "create")
+            }
             publish()
             stored
         }
@@ -203,6 +217,7 @@ class VmInstanceManager(
                 runtime.remove(vmId)
                 logs.remove(vmId)
                 launchCommands.remove(vmId)
+                gpsFixes.remove(vmId)
                 publish()
             }
             return removed
@@ -268,6 +283,7 @@ class VmInstanceManager(
                     "[ .. ] no qemu-system binary in sandbox; boot console renderer active on VNC ${profile.vncPort}"
                 }
             )
+            syncVirtualLocation(vmId, reason = "start")
             return true
         }
     }
@@ -338,6 +354,48 @@ class VmInstanceManager(
         if (removed) appendConsole(vmId, "Snapshot $snapshotId deleted")
         return removed
     }
+
+    // -------------------------------------------------------- virtual GPS
+
+    /**
+     * Renders the VM's virtual location into its shared folder and appends a
+     * console line whenever the fix actually changed, so the boot console shows
+     * live GPS feedback.
+     */
+    fun syncVirtualLocation(vmId: String, reason: String = "update"): GpsSyncResult? {
+        val profile = repository.get(vmId) ?: return null
+        val gps = profile.virtualLocation
+        val result = runCatching {
+            virtualGps.syncToVm(profile, repository.sharedDir(vmId))
+        }.onFailure { error ->
+            appendConsole(vmId, "[GPS] sync failed: ${error.message ?: error.javaClass.simpleName}")
+        }.getOrNull() ?: return null
+
+        val signature = fixSignature(gps.latitude, gps.longitude)
+        val previous = synchronized(lock) { gpsFixes.put(vmId, signature) }
+        if (previous != signature) {
+            if (gps.enabled) {
+                appendConsole(
+                    vmId,
+                    "[GPS] fix ($reason) ${coordinate(gps.latitude)}, ${coordinate(gps.longitude)} " +
+                        "alt ${coordinate(gps.altitude)}m · ${gps.mode.name.lowercase(Locale.US)} · " +
+                        "${gps.presetName} · NMEA ${result.nmeaFile.name}"
+                )
+                appendConsole(vmId, "[GPS] inject: ${result.adbGeoCommand}")
+            } else {
+                appendConsole(vmId, "[GPS] virtual location disabled; real provider reported")
+            }
+        }
+        return result
+    }
+
+    /** Last fix logged for [vmId], e.g. `39.904200,116.407400`. */
+    fun lastVirtualFix(vmId: String): String? = synchronized(lock) { gpsFixes[vmId] }
+
+    private fun fixSignature(latitude: Double, longitude: Double): String =
+        coordinate(latitude) + "," + coordinate(longitude)
+
+    private fun coordinate(value: Double): String = String.format(Locale.US, "%.6f", value)
 
     // --------------------------------------------------------------- helpers
 

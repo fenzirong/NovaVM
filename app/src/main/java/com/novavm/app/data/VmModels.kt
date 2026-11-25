@@ -267,6 +267,100 @@ data class RootXposedConfig(
     val stagedModules: List<String> = emptyList()
 )
 
+/** How the mock GPS fix is driven from the UI. */
+@Serializable
+enum class VirtualLocationMode {
+    /** One fixed point, optionally with micro jitter. */
+    STATIC,
+
+    /** Walk along [VirtualLocationConfig.routeWaypoints]. */
+    ROUTE_WALK,
+
+    /** Manual D-Pad / joystick stepping. */
+    JOYSTICK
+}
+
+/** A single WGS-84 coordinate, optionally labelled for route waypoints. */
+@Serializable
+data class GeoPoint(
+    val latitude: Double,
+    val longitude: Double,
+    val altitude: Double = 35.0,
+    val label: String = ""
+) {
+    override fun toString(): String =
+        String.format(java.util.Locale.US, "%.6f, %.6f", latitude, longitude)
+}
+
+/**
+ * Mock GPS configuration handed to the guest through NMEA sentences, the
+ * `persist.novavm.gps.*` properties and the ADB `emu geo fix` command.
+ */
+@Serializable
+data class VirtualLocationConfig(
+    val enabled: Boolean = false,
+    val presetName: String = "北京 · 天安门",
+    val latitude: Double = 39.9042,
+    val longitude: Double = 116.4074,
+    val altitude: Double = 43.5,
+    val accuracyMeters: Float = 5.0f,
+    val speedMps: Float = 1.4f,
+    val bearingDegrees: Float = 0.0f,
+    val mode: VirtualLocationMode = VirtualLocationMode.STATIC,
+    val jitterEnabled: Boolean = true,
+    val routeWaypoints: List<GeoPoint> = emptyList()
+) {
+    val geoPoint: GeoPoint get() = GeoPoint(latitude, longitude, altitude, presetName)
+
+    fun withCoordinates(
+        latitude: Double,
+        longitude: Double,
+        presetName: String = this.presetName
+    ): VirtualLocationConfig = copy(
+        latitude = latitude,
+        longitude = longitude,
+        presetName = presetName
+    )
+}
+
+/** Curated one-tap teleport targets for the virtual location radar. */
+object LocationPresets {
+
+    private fun preset(name: String, lat: Double, lon: Double, alt: Double) =
+        VirtualLocationConfig(
+            enabled = true,
+            presetName = name,
+            latitude = lat,
+            longitude = lon,
+            altitude = alt
+        )
+
+    val beijingTiananmen: VirtualLocationConfig = preset("北京 · 天安门", 39.9042, 116.4074, 43.5)
+    val shanghaiLujiazui: VirtualLocationConfig = preset("上海 · 陆家嘴", 31.2397, 121.4998, 4.0)
+    val shenzhenNanshan: VirtualLocationConfig = preset("深圳 · 南山科技园", 22.5404, 113.9445, 12.0)
+    val tokyoShibuya: VirtualLocationConfig = preset("东京 · 涩谷", 35.6595, 139.7004, 40.0)
+    val sanFranciscoApplePark: VirtualLocationConfig = preset("旧金山 · Apple Park", 37.3346, -122.0090, 30.0)
+    val newYorkTimesSquare: VirtualLocationConfig = preset("纽约 · 时代广场", 40.7580, -73.9855, 10.0)
+    val londonBigBen: VirtualLocationConfig = preset("伦敦 · 大本钟", 51.5007, -0.1246, 15.0)
+
+    val all: List<VirtualLocationConfig> = listOf(
+        beijingTiananmen,
+        shanghaiLujiazui,
+        shenzhenNanshan,
+        tokyoShibuya,
+        sanFranciscoApplePark,
+        newYorkTimesSquare,
+        londonBigBen
+    )
+
+    val names: List<String> = all.map { it.presetName }
+
+    val points: List<GeoPoint> = all.map { it.geoPoint }
+
+    fun byName(name: String): VirtualLocationConfig =
+        all.firstOrNull { it.presetName.equals(name, ignoreCase = true) } ?: beijingTiananmen
+}
+
 @Serializable
 data class VmSnapshot(
     val id: String,
@@ -286,6 +380,7 @@ data class VmProfile(
     val hardware: VmHardwareConfig = VmHardwareConfig(),
     val deviceSpoof: DeviceSpoofConfig = DevicePresets.pixel8Pro,
     val rootXposed: RootXposedConfig = RootXposedConfig(),
+    val virtualLocation: VirtualLocationConfig = VirtualLocationConfig(),
     val vncPort: Int = 5901,
     val qmpPort: Int = 4444,
     val adbForwardPort: Int = 15555,
@@ -310,6 +405,7 @@ data class VmProfile(
             hardware: VmHardwareConfig = VmHardwareConfig(),
             deviceSpoof: DeviceSpoofConfig = DevicePresets.pixel8Pro,
             rootXposed: RootXposedConfig = RootXposedConfig(),
+            virtualLocation: VirtualLocationConfig = VirtualLocationConfig(),
             vncPort: Int = 5901,
             qmpPort: Int = 4444,
             adbForwardPort: Int = 15555,
@@ -325,6 +421,7 @@ data class VmProfile(
             hardware = hardware,
             deviceSpoof = deviceSpoof,
             rootXposed = rootXposed,
+            virtualLocation = virtualLocation,
             vncPort = vncPort,
             qmpPort = qmpPort,
             adbForwardPort = adbForwardPort,

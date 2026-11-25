@@ -12,6 +12,7 @@ import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.ImportedRom
 import com.novavm.app.data.RomCatalogItem
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VmArchitecture
 import com.novavm.app.data.VmBackendType
 import com.novavm.app.data.VmHardwareConfig
@@ -20,6 +21,7 @@ import com.novavm.app.engine.DiskImageInfo
 import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.NativeEngine
 import com.novavm.app.engine.VmRuntimeState
+import com.novavm.app.location.GeoMath
 import com.novavm.app.transfer.SharedFileInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -48,7 +50,8 @@ data class VmDraft(
     val romPath: String = "",
     val hardware: VmHardwareConfig = VmHardwareConfig(),
     val deviceSpoof: DeviceSpoofConfig = DeviceSpoofConfig(),
-    val rootXposed: RootXposedConfig = RootXposedConfig(rootEnabled = true)
+    val rootXposed: RootXposedConfig = RootXposedConfig(rootEnabled = true),
+    val virtualLocation: VirtualLocationConfig = VirtualLocationConfig()
 )
 
 data class NovaUiState(
@@ -66,6 +69,8 @@ data class NovaUiState(
     val consoleLog: List<String> = emptyList(),
     val bootScriptPreview: String = "",
     val modules: List<String> = emptyList(),
+    val gpsNmeaLines: List<String> = emptyList(),
+    val gpsAdbCommand: String = "",
     val overlayGranted: Boolean = false,
     val loading: Boolean = false
 ) {
@@ -189,7 +194,8 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
                     backendType = draft.backendType,
                     hardware = draft.hardware,
                     deviceSpoof = draft.deviceSpoof,
-                    rootXposed = draft.rootXposed
+                    rootXposed = draft.rootXposed,
+                    virtualLocation = draft.virtualLocation
                 )
                 ensureDisk(created)
                 val romPath = draft.romPath
@@ -198,8 +204,12 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
                     draft.rootXposed,
                     draft.deviceSpoof,
                     draft.hardware,
-                    created.name
+                    created.name,
+                    draft.virtualLocation
                 )
+                if (draft.virtualLocation.enabled) {
+                    app.vmInstanceManager.syncVirtualLocation(created.id, "create")
+                }
                 app.setActiveVm(created.id)
                 created.id
             }
@@ -383,9 +393,85 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
                 config = profile.rootXposed,
                 spoof = profile.deviceSpoof,
                 hardware = profile.hardware,
-                profileName = profile.name
+                profileName = profile.name,
+                virtualLocation = profile.virtualLocation
             )
         }
+    }
+
+    // ------------------------------------------------------- virtual location
+
+    /**
+     * Persists a new mock GPS configuration, regenerates the guest scripts and
+     * re-syncs `novavm_gps.nmea` / `apply_location.sh`.
+     */
+    fun updateVirtualLocation(vmId: String, config: VirtualLocationConfig) {
+        saveVirtualLocation(vmId, config, toastText = "虚拟定位已更新")
+    }
+
+    /**
+     * Steps the current fix [distanceMeters] along [bearingDegrees] and syncs the
+     * guest artifacts immediately (D-Pad / joystick input).
+     */
+    fun nudgeVirtualLocation(vmId: String, bearingDegrees: Float, distanceMeters: Float) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val gps = profile.virtualLocation
+            val point = GeoMath.stepPosition(
+                gps.latitude,
+                gps.longitude,
+                bearingDegrees.toDouble(),
+                distanceMeters.toDouble()
+            )
+            val updated = gps.copy(
+                enabled = true,
+                latitude = point.latitude,
+                longitude = point.longitude,
+                bearingDegrees = normalizeBearing(bearingDegrees)
+            )
+            applyVirtualLocation(profile, updated)
+        }
+    }
+
+    private fun saveVirtualLocation(
+        vmId: String,
+        config: VirtualLocationConfig,
+        toastText: String
+    ) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            applyVirtualLocation(
+                profile,
+                config.copy(
+                    latitude = GeoMath.clampLat(config.latitude),
+                    longitude = GeoMath.normalizeLon(config.longitude)
+                )
+            )
+            toast(toastText)
+        }
+    }
+
+    private suspend fun applyVirtualLocation(profile: VmProfile, config: VirtualLocationConfig) {
+        val updated = profile.copy(virtualLocation = config)
+        onDisk { app.vmRepository.update(updated) }
+        regenerateBootFiles(updated)
+        onDisk { app.vmInstanceManager.syncVirtualLocation(profile.id, "update") }
+        refresh()
+        reloadSelected()
+    }
+
+    private fun normalizeBearing(bearing: Float): Float {
+        var value = bearing % 360f
+        if (value < 0f) value += 360f
+        return value
     }
 
     // ------------------------------------------------------------- snapshots
@@ -488,6 +574,13 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
             }.getOrDefault("")
         }
         val log = runCatching { app.vmInstanceManager.consoleLog(vmId) }.getOrDefault(emptyList())
+        val nmeaLines = onDisk {
+            runCatching { app.virtualGpsEngine.previewNmea(profile.virtualLocation) }
+                .getOrDefault(emptyList())
+        }
+        val adbCommand = runCatching {
+            app.virtualGpsEngine.adbGeoCommand(profile.virtualLocation, profile.adbForwardPort)
+        }.getOrDefault("")
         _state.update {
             it.copy(
                 selectedVmId = vmId,
@@ -496,7 +589,9 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
                 adbInstallCommands = commands,
                 modules = modules,
                 bootScriptPreview = bootScript,
-                consoleLog = log
+                consoleLog = log,
+                gpsNmeaLines = nmeaLines,
+                gpsAdbCommand = adbCommand
             )
         }
     }

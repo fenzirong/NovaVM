@@ -2,10 +2,14 @@ package com.novavm.app.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,7 +26,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
@@ -42,24 +49,30 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -67,8 +80,12 @@ import androidx.compose.ui.unit.sp
 import com.novavm.app.data.DevicePresets
 import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.DeviceSpoofGenerator
+import com.novavm.app.data.GeoPoint
 import com.novavm.app.data.GpuMode
+import com.novavm.app.data.LocationPresets
 import com.novavm.app.data.RootXposedConfig
+import com.novavm.app.data.VirtualLocationConfig
+import com.novavm.app.data.VirtualLocationMode
 import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmStatus
@@ -77,9 +94,13 @@ import com.novavm.app.ui.NovaVmViewModel
 import com.novavm.app.ui.components.NovaTag
 import com.novavm.app.ui.components.StatusPill
 import com.novavm.app.ui.theme.NovaPalette
+import java.util.Locale
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.min
 import kotlin.math.roundToInt
 
-private val detailTabs = listOf("硬件配置", "设备伪装", "Root & Xposed", "快照与日志")
+private val detailTabs = listOf("硬件配置", "设备伪装", "虚拟定位", "Root & Xposed", "快照与日志")
 
 @Composable
 fun VmDetailScreen(
@@ -181,10 +202,11 @@ fun VmDetailScreen(
             }
         }
 
-        TabRow(
+        ScrollableTabRow(
             selectedTabIndex = tab,
             containerColor = NovaPalette.Background,
-            contentColor = NovaPalette.Cyan
+            contentColor = NovaPalette.Cyan,
+            edgePadding = 8.dp
         ) {
             detailTabs.forEachIndexed { index, title ->
                 Tab(
@@ -204,7 +226,8 @@ fun VmDetailScreen(
         when (tab) {
             0 -> HardwareTab(profile, vm)
             1 -> SpoofTab(profile, vm)
-            2 -> RootTab(profile, state, vm)
+            2 -> VirtualLocationTab(profile, state, vm)
+            3 -> RootTab(profile, state, vm)
             else -> SnapshotLogTab(profile, state, vm)
         }
     }
@@ -694,6 +717,440 @@ private fun SnapshotLogTab(profile: VmProfile, state: NovaUiState, vm: NovaVmVie
 }
 
 // ------------------------------------------------------------------ helpers
+
+@Composable
+private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel) {
+    val gps = profile.virtualLocation
+    var enabled by remember(profile.id, gps) { mutableStateOf(gps.enabled) }
+    var presetName by remember(profile.id, gps) { mutableStateOf(gps.presetName) }
+    var latText by remember(profile.id, gps) { mutableStateOf(formatCoordinate(gps.latitude)) }
+    var lonText by remember(profile.id, gps) { mutableStateOf(formatCoordinate(gps.longitude)) }
+    var altText by remember(profile.id, gps) {
+        mutableStateOf(String.format(Locale.US, "%.1f", gps.altitude))
+    }
+    var accuracyText by remember(profile.id, gps) {
+        mutableStateOf(String.format(Locale.US, "%.1f", gps.accuracyMeters))
+    }
+    var speedText by remember(profile.id, gps) {
+        mutableStateOf(String.format(Locale.US, "%.2f", gps.speedMps))
+    }
+    var mode by remember(profile.id, gps) { mutableStateOf(gps.mode) }
+    var jitter by remember(profile.id, gps) { mutableStateOf(gps.jitterEnabled) }
+    var stepMeters by remember(profile.id) { mutableStateOf(20f) }
+    var nmeaOpen by remember(profile.id) { mutableStateOf(false) }
+    var copied by remember(profile.id) { mutableStateOf(false) }
+
+    val sessionTrail = remember(profile.id) { mutableStateListOf<GeoPoint>() }
+    LaunchedEffect(gps.latitude, gps.longitude) {
+        sessionTrail.add(GeoPoint(gps.latitude, gps.longitude, gps.altitude, gps.presetName))
+        while (sessionTrail.size > 48) sessionTrail.removeAt(0)
+    }
+
+    fun draft(): VirtualLocationConfig = VirtualLocationConfig(
+        enabled = enabled,
+        presetName = presetName,
+        latitude = latText.toDoubleOrNull() ?: gps.latitude,
+        longitude = lonText.toDoubleOrNull() ?: gps.longitude,
+        altitude = altText.toDoubleOrNull() ?: gps.altitude,
+        accuracyMeters = accuracyText.toFloatOrNull() ?: gps.accuracyMeters,
+        speedMps = speedText.toFloatOrNull() ?: gps.speedMps,
+        bearingDegrees = gps.bearingDegrees,
+        mode = mode,
+        jitterEnabled = jitter,
+        routeWaypoints = gps.routeWaypoints
+    )
+
+    val config = draft()
+    val trailPoints = sessionTrail.toList() + gps.routeWaypoints
+    val clipboard = LocalClipboardManager.current
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        DetailFormCard("虚拟定位总控") {
+            DetailToggle("启用虚拟定位", enabled) { checked ->
+                enabled = checked
+                vm.updateVirtualLocation(profile.id, draft().copy(enabled = checked))
+            }
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                NovaTag(
+                    text = if (enabled) "GPS ON" else "GPS OFF",
+                    color = if (enabled) NovaPalette.Emerald else NovaPalette.TextMuted
+                )
+                NovaTag(modeLabel(mode), NovaPalette.Cyan)
+                NovaTag(if (jitter) "抖动 ±2m" else "固定坐标", NovaPalette.Violet)
+                NovaTag("NMEA 0183", NovaPalette.Amber)
+            }
+            Text(
+                text = "${presetName.ifBlank { "自定义坐标" }} · " +
+                    "${formatCoordinate(config.latitude)}, ${formatCoordinate(config.longitude)} · " +
+                    "alt ${String.format(Locale.US, "%.1f", config.altitude)}m",
+                color = NovaPalette.TextSecondary,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+
+        Spacer(Modifier.height(14.dp))
+        CoordinateRadar(config = config, trail = trailPoints)
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("城市预设 · 一键传送") {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                LocationPresets.all.forEach { preset ->
+                    FilterChip(
+                        selected = presetName == preset.presetName,
+                        onClick = {
+                            presetName = preset.presetName
+                            latText = formatCoordinate(preset.latitude)
+                            lonText = formatCoordinate(preset.longitude)
+                            altText = String.format(Locale.US, "%.1f", preset.altitude)
+                            enabled = true
+                            vm.updateVirtualLocation(
+                                profile.id,
+                                draft().copy(
+                                    enabled = true,
+                                    presetName = preset.presetName,
+                                    latitude = preset.latitude,
+                                    longitude = preset.longitude,
+                                    altitude = preset.altitude
+                                )
+                            )
+                        },
+                        label = { Text(preset.presetName, fontSize = 11.sp) },
+                        colors = detailChipColors()
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("坐标与信号参数") {
+            DetailTextField("纬度 (latitude)", latText) { latText = it }
+            DetailTextField("经度 (longitude)", lonText) { lonText = it }
+            DetailTextField("海拔 (altitude m)", altText) { altText = it }
+            DetailTextField("精度 (accuracy m)", accuracyText) { accuracyText = it }
+            DetailTextField("速度 (speed m/s)", speedText) { speedText = it }
+            DetailToggle("随机微抖动 (±2m)", jitter) { jitter = it }
+            Text("模式", color = NovaPalette.TextSecondary, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VirtualLocationMode.entries.forEach { entry ->
+                    FilterChip(
+                        selected = mode == entry,
+                        onClick = { mode = entry },
+                        label = { Text(modeLabel(entry), fontSize = 11.sp) },
+                        colors = detailChipColors()
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("实时摇杆 · 步进定位") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(5f, 20f, 100f, 500f).forEach { step ->
+                    FilterChip(
+                        selected = stepMeters == step,
+                        onClick = { stepMeters = step },
+                        label = { Text("${step.roundToInt()}m", fontSize = 11.sp) },
+                        colors = detailChipColors()
+                    )
+                }
+            }
+            GpsDirectionPad(
+                stepMeters = stepMeters,
+                onStep = { bearing ->
+                    enabled = true
+                    vm.nudgeVirtualLocation(profile.id, bearing, stepMeters)
+                }
+            )
+            Text(
+                text = "每次点按立即写入 novavm_gps.nmea 并刷新 persist.novavm.gps.*。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("NMEA-0183 实时报文") {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { nmeaOpen = !nmeaOpen }
+                    .padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "报文 & ADB 注入命令预览",
+                    color = NovaPalette.TextSecondary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(
+                    imageVector = if (nmeaOpen) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = if (nmeaOpen) "收起" else "展开",
+                    tint = NovaPalette.TextMuted,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+            AnimatedVisibility(visible = nmeaOpen) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val payload = state.gpsNmeaLines.joinToString("\n") +
+                        "\n" + state.gpsAdbCommand
+                    Text(
+                        text = payload.ifBlank { "# 启用并保存定位后生成 NMEA 报文" },
+                        color = NovaPalette.Emerald,
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 13.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(NovaPalette.Background)
+                            .padding(10.dp)
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(payload))
+                            copied = true
+                        },
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.ContentCopy,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (copied) "已复制" else "复制报文", fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Button(
+            onClick = { vm.updateVirtualLocation(profile.id, draft()) },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = NovaPalette.Cyan,
+                contentColor = Color(0xFF04121C)
+            ),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("保存并同步虚拟定位")
+        }
+        Spacer(Modifier.height(40.dp))
+    }
+}
+
+@Composable
+private fun CoordinateRadar(config: VirtualLocationConfig, trail: List<GeoPoint>) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(214.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(NovaPalette.Background)
+            .border(1.dp, NovaPalette.Border.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
+    ) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(14.dp)
+        ) {
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val radius = (min(size.width, size.height) / 2f - 4f).coerceAtLeast(24f)
+            val rangeMeters = 500.0
+
+            listOf(0.34f, 0.67f, 1f).forEach { factor ->
+                drawCircle(
+                    color = NovaPalette.Cyan.copy(alpha = 0.16f),
+                    radius = radius * factor,
+                    center = center,
+                    style = Stroke(width = 1.2f)
+                )
+            }
+            val crosshair = NovaPalette.Cyan.copy(alpha = 0.16f)
+            drawLine(crosshair, Offset(center.x - radius, center.y), Offset(center.x + radius, center.y), 1f)
+            drawLine(crosshair, Offset(center.x, center.y - radius), Offset(center.x, center.y + radius), 1f)
+
+            if (trail.size > 1) {
+                val path = Path()
+                trail.forEachIndexed { index, point ->
+                    val offset = projectToRadar(point, config, center, radius, rangeMeters)
+                    if (index == 0) path.moveTo(offset.x, offset.y) else path.lineTo(offset.x, offset.y)
+                }
+                drawPath(path, NovaPalette.Violet.copy(alpha = 0.65f), style = Stroke(width = 2f))
+            }
+            trail.forEach { point ->
+                drawCircle(
+                    color = NovaPalette.Violet.copy(alpha = 0.85f),
+                    radius = 2.6f,
+                    center = projectToRadar(point, config, center, radius, rangeMeters)
+                )
+            }
+
+            drawCircle(NovaPalette.Cyan.copy(alpha = 0.16f), 15f, center)
+            drawCircle(NovaPalette.Cyan.copy(alpha = 0.32f), 8f, center)
+            drawCircle(NovaPalette.Cyan, 4f, center)
+        }
+
+        Text(
+            text = "N",
+            color = NovaPalette.TextMuted,
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 3.dp)
+        )
+        Text(
+            text = "E",
+            color = NovaPalette.TextMuted,
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 4.dp)
+        )
+        Text(
+            text = "S",
+            color = NovaPalette.TextMuted,
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 26.dp)
+        )
+        Text(
+            text = "W",
+            color = NovaPalette.TextMuted,
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .padding(start = 4.dp)
+        )
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 5.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = config.presetName.ifBlank { "自定义坐标" },
+                color = NovaPalette.TextPrimary,
+                fontSize = 10.sp
+            )
+            Text(
+                text = "${formatCoordinate(config.latitude)}, ${formatCoordinate(config.longitude)}",
+                color = NovaPalette.Cyan,
+                fontSize = 9.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+}
+
+@Composable
+private fun GpsDirectionPad(stepMeters: Float, onStep: (Float) -> Unit) {
+    val rows = listOf(
+        listOf(Triple("西北", "↖", 315f), Triple("北", "↑", 0f), Triple("东北", "↗", 45f)),
+        listOf(Triple("西", "←", 270f), Triple("东", "→", 90f)),
+        listOf(Triple("西南", "↙", 225f), Triple("南", "↓", 180f), Triple("东南", "↘", 135f))
+    )
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        rows.forEachIndexed { index, row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (index == 1) {
+                    Box(
+                        modifier = Modifier
+                            .size(58.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(NovaPalette.CyanSoft.copy(alpha = 0.6f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "${stepMeters.roundToInt()}m",
+                            color = NovaPalette.Cyan,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+                row.forEach { (label, arrow, bearing) ->
+                    GpsPadButton(label = label, arrow = arrow) { onStep(bearing) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GpsPadButton(label: String, arrow: String, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .size(58.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(NovaPalette.SurfaceMuted.copy(alpha = 0.75f))
+            .border(1.dp, NovaPalette.Cyan.copy(alpha = 0.25f), RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(text = arrow, color = NovaPalette.Cyan, fontSize = 15.sp)
+        Text(text = label, color = NovaPalette.TextSecondary, fontSize = 8.sp)
+    }
+}
+
+private fun projectToRadar(
+    point: GeoPoint,
+    origin: VirtualLocationConfig,
+    center: Offset,
+    radius: Float,
+    rangeMeters: Double
+): Offset {
+    val north = (point.latitude - origin.latitude) * 111_320.0
+    val east = (point.longitude - origin.longitude) * 111_320.0 *
+        cos(Math.toRadians(origin.latitude))
+    val scale = radius / rangeMeters
+    var dx = east * scale
+    var dy = -north * scale
+    val length = hypot(dx, dy)
+    if (length > radius) {
+        val factor = radius / length
+        dx *= factor
+        dy *= factor
+    }
+    return Offset((center.x + dx).toFloat(), (center.y + dy).toFloat())
+}
+
+private fun modeLabel(mode: VirtualLocationMode): String = when (mode) {
+    VirtualLocationMode.STATIC -> "定点"
+    VirtualLocationMode.ROUTE_WALK -> "轨迹"
+    VirtualLocationMode.JOYSTICK -> "摇杆"
+}
+
+private fun formatCoordinate(value: Double): String =
+    String.format(Locale.US, "%.6f", value)
 
 @Composable
 private fun DetailFormCard(title: String, content: @Composable () -> Unit) {
