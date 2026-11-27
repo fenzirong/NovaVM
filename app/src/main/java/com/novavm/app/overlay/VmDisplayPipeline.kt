@@ -171,6 +171,50 @@ class VmDisplayPipeline(
         }.getOrDefault(false)
     }
 
+    /**
+     * Snapshot of the framebuffer currently on screen as tightly packed RGBA8888
+     * bytes, little endian.
+     *
+     * That is exactly the layout [BootConsoleRenderer] paints and the RFB
+     * `SetPixelFormat` handshake negotiates, so the result can be handed straight
+     * to [VmScreenshotHelper.captureToGalleryOrAppDir] without channel shuffling.
+     * [rfbBuffer] is read while a guest is attached, [buffer] (the boot console)
+     * otherwise.
+     *
+     * The copy is taken under the same lock the painters use, so a frame is never
+     * captured half-written, and the live buffers keep their own position/limit
+     * because everything goes through `duplicate()`.
+     *
+     * @return `Triple(bytes, width, height)`, or `null` when no frame is ready.
+     */
+    fun captureCurrentFrameRgba(): Triple<ByteArray, Int, Int>? {
+        val live = rfb
+        if (rfbConnected && live != null && live.isConnected) {
+            return synchronized(rfbLock) {
+                val frameWidth = rfbWidth
+                val frameHeight = rfbHeight
+                if (frameWidth <= 0 || frameHeight <= 0) return@synchronized null
+                val bytes = copyRgba(rfbBuffer, frameWidth * frameHeight * RGBA_BYTES_PER_PIXEL)
+                bytes?.let { Triple(it, frameWidth, frameHeight) }
+            }
+        }
+        return synchronized(console) {
+            // Repaint once so the snapshot matches what the surface is showing.
+            console.render(buffer, SystemClock.uptimeMillis())
+            val bytes = copyRgba(buffer, width * height * RGBA_BYTES_PER_PIXEL)
+            bytes?.let { Triple(it, width, height) }
+        }
+    }
+
+    /** Copies the first [size] bytes of [source] without touching its position. */
+    private fun copyRgba(source: ByteBuffer, size: Int): ByteArray? {
+        if (size <= 0 || source.capacity() < size) return null
+        val view = source.duplicate()
+        view.clear()
+        view.limit(size)
+        return ByteArray(size).also { view.get(it) }
+    }
+
     // ------------------------------------------------------------- threads
 
     private fun startRenderThread() {
@@ -586,6 +630,9 @@ class VmDisplayPipeline(
         private const val BOOT_JOIN_MS = 800L
         private const val RENDER_JOIN_MS = 600L
         private const val RFB_JOIN_MS = 600L
+
+        /** RGBA8888: four bytes per pixel in every framebuffer path. */
+        private const val RGBA_BYTES_PER_PIXEL = 4
 
         /** Guest geometry accepted for the staging buffer (guards allocation). */
         private const val MIN_GUEST_DIMENSION = 64

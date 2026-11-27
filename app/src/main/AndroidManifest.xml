@@ -7,6 +7,20 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
+        Android 11+ package visibility: the 「导入本机应用」 list only needs apps
+        that expose a launcher activity. Using a MAIN/LAUNCHER intent query
+        instead of QUERY_ALL_PACKAGES keeps the Play `QueryAllPackagesPermission`
+        lint check clean.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:name=".NovaVmApp"
@@ -45,6 +59,15 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="floating_vm_display" />
+        </service>
+
+        <service
+            android:name=".overlay.KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="screen_off_keep_alive" />
         </service>
 
     </application>

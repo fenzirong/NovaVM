@@ -1,5 +1,6 @@
 package com.novavm.app.ui.screens
 
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -70,21 +72,27 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.novavm.app.data.BackgroundKeepAliveConfig
 import com.novavm.app.data.DevicePresets
 import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.DeviceSpoofGenerator
 import com.novavm.app.data.GeoPoint
+import com.novavm.app.data.GmsConfig
 import com.novavm.app.data.GpuMode
 import com.novavm.app.data.LocationPresets
 import com.novavm.app.data.RootXposedConfig
 import com.novavm.app.data.RouteLoopMode
 import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VirtualLocationMode
+import com.novavm.app.data.VirtualSensorConfig
 import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmStatus
@@ -92,6 +100,7 @@ import com.novavm.app.location.GeoMath
 import com.novavm.app.location.MapTileSource
 import com.novavm.app.location.RoutePlaybackState
 import com.novavm.app.location.RouteSimulator
+import com.novavm.app.overlay.KeepAliveService
 import com.novavm.app.ui.NovaUiState
 import com.novavm.app.ui.NovaVmViewModel
 import com.novavm.app.ui.components.InteractiveGeoMap
@@ -103,7 +112,14 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-private val detailTabs = listOf("硬件配置", "设备伪装", "虚拟定位", "Root 与 Xposed", "快照与日志")
+private val detailTabs = listOf(
+    "硬件配置",
+    "设备伪装",
+    "虚拟定位",
+    "Root 与 Xposed",
+    "VMOS 增强",
+    "快照与日志"
+)
 
 @Composable
 fun VmDetailScreen(
@@ -231,6 +247,7 @@ fun VmDetailScreen(
             1 -> SpoofTab(profile, vm)
             2 -> VirtualLocationTab(profile, state, vm)
             3 -> RootTab(profile, state, vm)
+            4 -> VmosTab(profile, vm)
             else -> SnapshotLogTab(profile, state, vm)
         }
     }
@@ -461,7 +478,76 @@ private fun SpoofTab(profile: VmProfile, vm: NovaVmViewModel) {
             Spacer(Modifier.width(6.dp))
             Text("保存设备伪装")
         }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("一键新机") {
+            Text(
+                text = "同时重置设备指纹（IMEI / Android ID / Wi-Fi MAC）与 SIM 及网络指纹" +
+                    "（IMSI / ICCID / GAID / 序列号 / 运营商 / BSSID / 蓝牙 MAC），" +
+                    "并重新生成客户机引导脚本。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+            Button(
+                onClick = { vm.oneKeyNewDevice(profile.id) },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Amber,
+                    contentColor = Color(0xFF1A1206)
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("一键新机（重置全部设备/SIM/网络指纹）", fontSize = 12.sp)
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("扩展设备指纹") {
+            IdentityRow("IMSI", profile.extendedIdentity.imsi)
+            IdentityRow("ICCID", profile.extendedIdentity.iccid)
+            IdentityRow("GAID", profile.extendedIdentity.gaid)
+            IdentityRow("序列号", profile.extendedIdentity.serialNumber)
+            IdentityRow(
+                label = "运营商",
+                value = listOf(profile.extendedIdentity.carrierName, profile.extendedIdentity.mccMnc)
+                    .filter { it.isNotBlank() }
+                    .joinToString(" · ")
+            )
+            IdentityRow("手机号", profile.extendedIdentity.phoneNumber)
+            IdentityRow("Wi-Fi SSID", profile.extendedIdentity.wifiSsid)
+            IdentityRow("Wi-Fi BSSID", profile.extendedIdentity.wifiBssid)
+            IdentityRow("蓝牙 MAC", profile.extendedIdentity.bluetoothMac)
+            Text(
+                text = "以上字段写入 shared/novavm_vmos_ext.sh，随每次启动同步到客户机。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+        }
         Spacer(Modifier.height(40.dp))
+    }
+}
+
+@Composable
+private fun IdentityRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            color = NovaPalette.TextSecondary,
+            fontSize = 11.sp,
+            modifier = Modifier.width(88.dp)
+        )
+        Text(
+            text = value.ifBlank { "—" },
+            color = if (value.isBlank()) NovaPalette.TextMuted else NovaPalette.Cyan,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.weight(1f)
+        )
     }
 }
 
@@ -471,6 +557,12 @@ private fun RootTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel)
     var xposedEnabled by remember(profile.id) { mutableStateOf(profile.rootXposed.xposedEnabled) }
     var selinux by remember(profile.id) { mutableStateOf(profile.rootXposed.selinuxPermissive) }
     var magiskHide by remember(profile.id) { mutableStateOf(profile.rootXposed.magiskHideEnabled) }
+
+    var gmsEnabled by remember(profile.id) { mutableStateOf(profile.gms.enabled) }
+    var microGMode by remember(profile.id) { mutableStateOf(profile.gms.microGMode) }
+    var playStore by remember(profile.id) { mutableStateOf(profile.gms.playStoreEnabled) }
+    var denyList by remember(profile.id) { mutableStateOf(profile.gms.zygiskDenyList) }
+    var newDenyPackage by remember(profile.id) { mutableStateOf("") }
 
     val modulePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -512,6 +604,101 @@ private fun RootTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel)
                 Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("保存 Root / Xposed 配置")
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("Google 服务框架（GMS / MicroG）") {
+            DetailToggle("GMS 总开关", gmsEnabled) { gmsEnabled = it }
+            DetailToggle("MicroG 轻量模式", microGMode) { microGMode = it }
+            DetailToggle("Play 商店", playStore) { playStore = it }
+            Text(
+                text = "Zygisk DenyList（${denyList.size} 个包名）",
+                color = NovaPalette.TextSecondary,
+                fontSize = 11.sp
+            )
+            if (denyList.isEmpty()) {
+                Text(
+                    text = "DenyList 为空：客户机不隐藏任何包名。",
+                    color = NovaPalette.TextMuted,
+                    fontSize = 10.sp
+                )
+            } else {
+                denyList.forEach { packageName ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = packageName,
+                            color = NovaPalette.TextPrimary,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = { denyList = denyList.filterNot { it == packageName } },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "移除 $packageName",
+                                tint = NovaPalette.Coral,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = newDenyPackage,
+                    onValueChange = { newDenyPackage = it.trim() },
+                    label = { Text("添加包名", fontSize = 11.sp) },
+                    singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    ),
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(
+                    onClick = {
+                        val candidate = newDenyPackage.trim()
+                        if (candidate.isNotBlank() && denyList.none { it == candidate }) {
+                            denyList = denyList + candidate
+                            newDenyPackage = ""
+                        }
+                    },
+                    shape = RoundedCornerShape(10.dp)
+                ) { Text("添加", fontSize = 11.sp) }
+            }
+            Button(
+                onClick = {
+                    vm.updateGms(
+                        profile.id,
+                        GmsConfig(
+                            enabled = gmsEnabled,
+                            microGMode = microGMode,
+                            playStoreEnabled = playStore,
+                            zygiskDenyList = denyList
+                        )
+                    )
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Cyan,
+                    contentColor = Color(0xFF04121C)
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("保存 GMS 配置", fontSize = 12.sp)
             }
         }
 
@@ -573,6 +760,217 @@ private fun RootTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel)
                     .background(NovaPalette.Background)
                     .padding(10.dp)
             )
+        }
+        Spacer(Modifier.height(40.dp))
+    }
+}
+
+@Composable
+private fun VmosTab(profile: VmProfile, vm: NovaVmViewModel) {
+    val context = LocalContext.current
+
+    var keepAlive by remember(profile.id) { mutableStateOf(profile.keepAlive) }
+    var sensors by remember(profile.id) { mutableStateOf(profile.sensors) }
+    var pinInput by remember(profile.id) { mutableStateOf("") }
+    var pinError by remember(profile.id) { mutableStateOf<String?>(null) }
+
+    val backupPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        if (uri != null) vm.exportVmBackup(profile.id, uri)
+    }
+
+    fun applyPin(action: (String) -> Unit) {
+        val pin = pinInput.trim()
+        val validLength = pin.length in
+            NovaVmViewModel.PRIVACY_PIN_MIN_LENGTH..NovaVmViewModel.PRIVACY_PIN_MAX_LENGTH
+        if (!validLength || pin.any { !it.isDigit() }) {
+            pinError = "请输入 4-6 位数字密码"
+            return
+        }
+        pinError = null
+        action(pin)
+        pinInput = ""
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        DetailFormCard("息屏挂机与后台保活") {
+            DetailToggle("息屏挂机（屏幕关闭后继续运行）", keepAlive.screenOffKeepAlive) { checked ->
+                keepAlive = keepAlive.copy(screenOffKeepAlive = checked)
+                vm.updateKeepAlive(profile.id, keepAlive.copy(screenOffKeepAlive = checked))
+            }
+            OutlinedButton(
+                onClick = {
+                    val intent = KeepAliveService.requestIgnoreBatteryOptimizationsIntent(context)
+                    if (intent == null) {
+                        Toast.makeText(context, "已在电池优化白名单内", Toast.LENGTH_SHORT).show()
+                    } else {
+                        context.startActivity(intent)
+                    }
+                },
+                shape = RoundedCornerShape(10.dp)
+            ) { Text("申请忽略电池优化", fontSize = 11.sp) }
+            DetailToggle("剪切板同步（shared/clipboard.txt）", keepAlive.clipboardSyncEnabled) {
+                keepAlive = keepAlive.copy(clipboardSyncEnabled = it)
+            }
+            DetailToggle("默认横屏锁定", keepAlive.landscapeLocked) {
+                keepAlive = keepAlive.copy(landscapeLocked = it)
+            }
+            Button(
+                onClick = { vm.updateKeepAlive(profile.id, keepAlive) },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Cyan,
+                    contentColor = Color(0xFF04121C)
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("保存挂机设置", fontSize = 12.sp)
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("虚拟传感器与电量模拟") {
+            DetailToggle("自定义电量", sensors.batteryOverrideEnabled) {
+                sensors = sensors.copy(batteryOverrideEnabled = it)
+            }
+            DetailSlider(
+                label = "电量",
+                valueText = "${sensors.batteryLevel}%",
+                value = sensors.batteryLevel.toFloat(),
+                range = 5f..100f,
+                steps = 18
+            ) { sensors = sensors.copy(batteryLevel = it.roundToInt().coerceIn(5, 100)) }
+            DetailToggle("充电状态", sensors.batteryCharging) {
+                sensors = sensors.copy(batteryCharging = it)
+            }
+            DetailSlider(
+                label = "电池温度",
+                valueText = String.format(Locale.US, "%.1f ℃", sensors.batteryTempC),
+                value = sensors.batteryTempC.coerceIn(20f, 45f),
+                range = 20f..45f,
+                steps = 24
+            ) { sensors = sensors.copy(batteryTempC = (it * 10f).roundToInt() / 10f) }
+            DetailToggle("虚拟步数", sensors.stepCounterEnabled) {
+                sensors = sensors.copy(stepCounterEnabled = it)
+            }
+            DetailSlider(
+                label = "每日步数",
+                valueText = "${sensors.dailySteps} 步",
+                value = sensors.dailySteps.toFloat(),
+                range = 0f..30000f,
+                steps = 29
+            ) { sensors = sensors.copy(dailySteps = (it / 1000f).roundToInt() * 1000) }
+            DetailToggle("虚拟摄像头", sensors.virtualCameraEnabled) {
+                sensors = sensors.copy(virtualCameraEnabled = it)
+            }
+            DetailToggle("虚拟麦克风", sensors.virtualMicEnabled) {
+                sensors = sensors.copy(virtualMicEnabled = it)
+            }
+            Button(
+                onClick = { vm.updateSensors(profile.id, sensors) },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Cyan,
+                    contentColor = Color(0xFF04121C)
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("保存传感器配置", fontSize = 12.sp)
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("虚拟机隐私锁") {
+            if (profile.privacyLock.enabled) {
+                Text(
+                    text = "隐私锁已开启：打开 / 启动 / 编辑该虚拟机前需要输入 4-6 位数字密码。",
+                    color = NovaPalette.Emerald,
+                    fontSize = 11.sp
+                )
+            } else {
+                Text(
+                    text = "尚未启用隐私锁。设置密码后，打开 / 启动 / 编辑该虚拟机需要先解锁。",
+                    color = NovaPalette.TextMuted,
+                    fontSize = 11.sp
+                )
+            }
+            OutlinedTextField(
+                value = pinInput,
+                onValueChange = { input ->
+                    pinInput = input.filter { it.isDigit() }.take(6)
+                    pinError = null
+                },
+                label = { Text(if (profile.privacyLock.enabled) "新密码" else "隐私密码") },
+                singleLine = true,
+                isError = pinError != null,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (pinError != null) {
+                Text(text = pinError.orEmpty(), color = NovaPalette.Coral, fontSize = 11.sp)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { applyPin { pin -> vm.setPrivacyPin(profile.id, pin) } },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NovaPalette.Cyan,
+                        contentColor = Color(0xFF04121C)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = if (profile.privacyLock.enabled) "修改密码" else "设置隐私密码",
+                        fontSize = 12.sp
+                    )
+                }
+                if (profile.privacyLock.enabled) {
+                    OutlinedButton(
+                        onClick = { vm.disablePrivacyLock(profile.id) },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("关闭隐私锁", color = NovaPalette.Coral, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        DetailFormCard("整机备份导出") {
+            Text(
+                text = "导出 profile.json + shared/ + modules/ 为 .nvmbak 压缩包；" +
+                    "磁盘镜像体积过大，不包含在备份内。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+            Button(
+                onClick = {
+                    val suggested = profile.displayName.replace('/', '_').replace('\\', '_')
+                    backupPicker.launch("$suggested.nvmbak")
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Violet.copy(alpha = 0.92f),
+                    contentColor = Color(0xFF120A24)
+                ),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("导出 .nvmbak 备份包", fontSize = 12.sp)
+            }
         }
         Spacer(Modifier.height(40.dp))
     }

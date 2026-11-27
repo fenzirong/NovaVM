@@ -14,6 +14,7 @@ import com.novavm.app.data.VmStatus
 import com.novavm.app.location.GpsSyncResult
 import com.novavm.app.location.VirtualGpsEngine
 import com.novavm.app.root.RootXposedConfigurator
+import com.novavm.app.root.VmosFeatureInjector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -520,19 +521,33 @@ class VmInstanceManager(
     }
 
     /**
-     * Regenerates `shared/novavm_boot.sh` + `shared/init.novavm.rc` so the
-     * `STAGE 2 / STORAGE & SHARE` step always reports up-to-date guest scripts.
+     * Regenerates `shared/novavm_boot.sh` + `shared/init.novavm.rc` and syncs
+     * `shared/novavm_vmos_ext.sh`, so the `STAGE 2 / STORAGE & SHARE` step always
+     * reports up-to-date guest scripts.
      */
     private fun writeBootScripts(profile: VmProfile) {
         try {
             repository.ensureVmDirectories(profile.id)
+            val vmDir = repository.vmDir(profile.id)
             val files = RootXposedConfigurator(repository, profile.id).writeAll(
                 config = profile.rootXposed,
                 spoof = profile.deviceSpoof,
                 hardware = profile.hardware,
                 profileName = profile.displayName,
-                virtualLocation = profile.virtualLocation
+                virtualLocation = profile.virtualLocation,
+                vmos = profile.vmosBundle()
             )
+            // writeAll already invoked the injector through the bundle; this call
+            // guarantees the extension script exists even for a bare profile.
+            runCatching {
+                VmosFeatureInjector.writeExtensionScript(
+                    vmDir = vmDir,
+                    gms = profile.gms,
+                    sensors = profile.sensors,
+                    identity = profile.extendedIdentity,
+                    keepAlive = profile.keepAlive
+                )
+            }
             appendConsole(
                 profile.id,
                 "[ OK ] boot scripts staged: ${files.joinToString(", ") { it.name }}"

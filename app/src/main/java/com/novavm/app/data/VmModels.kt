@@ -399,6 +399,21 @@ data class VmProfile(
     val deviceSpoof: DeviceSpoofConfig = DevicePresets.pixel8Pro,
     val rootXposed: RootXposedConfig = RootXposedConfig(),
     val virtualLocation: VirtualLocationConfig = VirtualLocationConfig(),
+    /**
+     * VMOS-parity extended identifiers (IMSI / ICCID / GAID / serial / carrier /
+     * Wi-Fi BSSID / Bluetooth MAC). Defaulted, so profiles written by older
+     * builds keep decoding — a missing field simply generates a fresh identity.
+     */
+    val extendedIdentity: ExtendedDeviceIdentity =
+        OneKeyNewDeviceGenerator.generateExtendedIdentity(),
+    /** GMS / MicroG / Play Store switches plus the Zygisk DenyList. */
+    val gms: GmsConfig = GmsConfig(),
+    /** Virtual battery, step counter, camera and microphone overrides. */
+    val sensors: VirtualSensorConfig = VirtualSensorConfig(),
+    /** Screen-off keep-alive, clipboard bridge and orientation lock. */
+    val keepAlive: BackgroundKeepAliveConfig = BackgroundKeepAliveConfig(),
+    /** Optional PIN gate for the VM list. */
+    val privacyLock: VmPrivacyLockConfig = VmPrivacyLockConfig(),
     val vncPort: Int = 5901,
     val qmpPort: Int = 4444,
     val adbForwardPort: Int = 15555,
@@ -406,6 +421,14 @@ data class VmProfile(
     val snapshots: List<VmSnapshot> = emptyList()
 ) {
     val displayName: String get() = name.ifBlank { id }
+
+    /** Feature bundle handed to the VMOS extension injector on boot-script writes. */
+    fun vmosBundle(): VmosFeatureBundle = VmosFeatureBundle(
+        gms = gms,
+        sensors = sensors,
+        identity = extendedIdentity,
+        keepAlive = keepAlive
+    )
 
     fun withSnapshot(snapshot: VmSnapshot): VmProfile =
         copy(snapshots = snapshots + snapshot)
@@ -424,6 +447,12 @@ data class VmProfile(
             deviceSpoof: DeviceSpoofConfig = DevicePresets.pixel8Pro,
             rootXposed: RootXposedConfig = RootXposedConfig(),
             virtualLocation: VirtualLocationConfig = VirtualLocationConfig(),
+            extendedIdentity: ExtendedDeviceIdentity =
+                OneKeyNewDeviceGenerator.generateExtendedIdentity(),
+            gms: GmsConfig = GmsConfig(),
+            sensors: VirtualSensorConfig = VirtualSensorConfig(),
+            keepAlive: BackgroundKeepAliveConfig = BackgroundKeepAliveConfig(),
+            privacyLock: VmPrivacyLockConfig = VmPrivacyLockConfig(),
             vncPort: Int = 5901,
             qmpPort: Int = 4444,
             adbForwardPort: Int = 15555,
@@ -440,6 +469,11 @@ data class VmProfile(
             deviceSpoof = deviceSpoof,
             rootXposed = rootXposed,
             virtualLocation = virtualLocation,
+            extendedIdentity = extendedIdentity,
+            gms = gms,
+            sensors = sensors,
+            keepAlive = keepAlive,
+            privacyLock = privacyLock,
             vncPort = vncPort,
             qmpPort = qmpPort,
             adbForwardPort = adbForwardPort,

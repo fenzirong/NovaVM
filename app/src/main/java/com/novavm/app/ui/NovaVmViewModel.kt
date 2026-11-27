@@ -8,17 +8,24 @@ import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.novavm.app.NovaVmApp
+import com.novavm.app.data.BackgroundKeepAliveConfig
 import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.GeoPoint
+import com.novavm.app.data.GmsConfig
 import com.novavm.app.data.ImportedRom
+import com.novavm.app.data.OneKeyNewDeviceGenerator
+import com.novavm.app.data.PinHashUtil
 import com.novavm.app.data.RomCatalogItem
 import com.novavm.app.data.RootXposedConfig
 import com.novavm.app.data.RouteLoopMode
 import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VirtualLocationMode
+import com.novavm.app.data.VirtualSensorConfig
 import com.novavm.app.data.VmArchitecture
 import com.novavm.app.data.VmBackendType
+import com.novavm.app.data.VmBackupManager
 import com.novavm.app.data.VmHardwareConfig
+import com.novavm.app.data.VmPrivacyLockConfig
 import com.novavm.app.data.VmProfile
 import com.novavm.app.engine.DiskImageInfo
 import com.novavm.app.engine.HostCapabilities
@@ -26,6 +33,9 @@ import com.novavm.app.engine.NativeEngine
 import com.novavm.app.engine.VmRuntimeState
 import com.novavm.app.location.GeoMath
 import com.novavm.app.location.RoutePlaybackState
+import com.novavm.app.overlay.KeepAliveService
+import com.novavm.app.transfer.HostAppExtractor
+import com.novavm.app.transfer.HostAppInfo
 import com.novavm.app.transfer.SharedFileInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -93,6 +103,14 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
 
     private val app: NovaVmApp = application as NovaVmApp
     private val messageIds = AtomicLong(0L)
+
+    companion object {
+        /** Guest-visible clipboard file the screen-off bridge polls. */
+        const val CLIPBOARD_FILE_NAME = "clipboard.txt"
+
+        const val PRIVACY_PIN_MIN_LENGTH = 4
+        const val PRIVACY_PIN_MAX_LENGTH = 6
+    }
 
     private val _state = MutableStateFlow(
         NovaUiState(
@@ -403,9 +421,236 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
                 spoof = profile.deviceSpoof,
                 hardware = profile.hardware,
                 profileName = profile.name,
-                virtualLocation = profile.virtualLocation
+                virtualLocation = profile.virtualLocation,
+                // Keeps shared/novavm_vmos_ext.sh in step with the profile too.
+                vmos = profile.vmosBundle()
             )
         }
+    }
+
+    // ------------------------------------------------------ VMOS parity suite
+
+    /** Host apps offered by the 「导入本机应用」 segment on the transfer screen. */
+    private val _hostApps = MutableStateFlow<List<HostAppInfo>>(emptyList())
+    val hostApps: StateFlow<List<HostAppInfo>> = _hostApps.asStateFlow()
+
+    /** Screen-off keep-alive service state, mirrored for the home banner and HUD. */
+    val keepAliveRunning: StateFlow<Boolean> = KeepAliveService.isRunning
+
+    private val backupManager = VmBackupManager()
+
+    /**
+     * 一键新机：同时重置 [DeviceSpoofConfig]（IMEI / Android ID / Wi-Fi MAC）与
+     * [ExtendedDeviceIdentity]（IMSI / ICCID / GAID / 序列号 / 运营商 / BSSID /
+     * 蓝牙 MAC），落盘后重新生成客户机引导脚本。
+     */
+    fun oneKeyNewDevice(vmId: String) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val (spoof, identity) = OneKeyNewDeviceGenerator.generateFullDeviceIdentity(
+                profile.deviceSpoof
+            )
+            val updated = profile.copy(
+                deviceSpoof = spoof.copy(presetName = profile.deviceSpoof.presetName),
+                extendedIdentity = identity
+            )
+            onDisk { app.vmRepository.update(updated) }
+            regenerateBootFiles(updated)
+            refresh()
+            reloadSelected()
+            toast("已完成一键新机")
+        }
+    }
+
+    fun updateGms(vmId: String, gms: GmsConfig) {
+        saveFeatureConfig(vmId, "Google 服务框架配置已更新") { it.copy(gms = gms) }
+    }
+
+    fun updateSensors(vmId: String, sensors: VirtualSensorConfig) {
+        saveFeatureConfig(vmId, "虚拟传感器配置已更新") { it.copy(sensors = sensors) }
+    }
+
+    /**
+     * Persists the keep-alive preferences and mirrors
+     * [BackgroundKeepAliveConfig.screenOffKeepAlive] onto the foreground service:
+     * the first VM opting in starts it, turning the last one off stops it.
+     */
+    fun updateKeepAlive(vmId: String, keepAlive: BackgroundKeepAliveConfig) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val updated = profile.copy(keepAlive = keepAlive)
+            onDisk { app.vmRepository.update(updated) }
+            regenerateBootFiles(updated)
+            val profiles = _state.value.vms.map { if (it.id == vmId) updated else it }
+            syncKeepAliveService(profiles)
+            refresh()
+            reloadSelected()
+            toast(if (keepAlive.screenOffKeepAlive) "已开启息屏挂机" else "已关闭息屏挂机")
+        }
+    }
+
+    fun setPrivacyPin(vmId: String, pin: String) {
+        val normalized = pin.trim()
+        val validLength = normalized.length in PRIVACY_PIN_MIN_LENGTH..PRIVACY_PIN_MAX_LENGTH
+        if (!validLength || normalized.any { !it.isDigit() }) {
+            toast("隐私密码需为 4-6 位数字", isError = true)
+            return
+        }
+        saveFeatureConfig(vmId, "隐私密码已设置") { profile ->
+            profile.copy(
+                privacyLock = VmPrivacyLockConfig(
+                    enabled = true,
+                    pinHash = PinHashUtil.hashPin(normalized)
+                )
+            )
+        }
+    }
+
+    fun disablePrivacyLock(vmId: String) {
+        saveFeatureConfig(vmId, "隐私锁已关闭") {
+            it.copy(privacyLock = VmPrivacyLockConfig())
+        }
+    }
+
+    /** Verifies a PIN against the in-memory profile; no disk read on the UI thread. */
+    fun verifyPrivacyPin(vmId: String, pin: String): Boolean {
+        val profile = _state.value.vms.firstOrNull { it.id == vmId } ?: return false
+        val lock = profile.privacyLock
+        if (!lock.enabled || lock.pinHash.isBlank()) return false
+        return PinHashUtil.verifyPin(pin.trim(), lock.pinHash)
+    }
+
+    fun refreshHostApps(includeSystem: Boolean = false) {
+        io {
+            val installed = onDisk {
+                HostAppExtractor.listInstalledApps(app, includeSystem = includeSystem)
+            }
+            _hostApps.value = installed
+        }
+    }
+
+    /**
+     * Extracts [hostApp]'s base APK into the VM share on [Dispatchers.IO] and
+     * refreshes the staged-APK listing.
+     */
+    fun importHostAppToVm(vmId: String, app: HostAppInfo) {
+        val novaApp = this.app
+        io {
+            val staged = onDisk {
+                HostAppExtractor.extractApkToVm(app, novaApp.transferManagerFor(vmId))
+            }
+            novaApp.vmInstanceManager.appendConsole(
+                vmId,
+                "[ OK ] host app staged: ${app.packageName} -> ${staged.name}"
+            )
+            reloadSelected()
+            toast("已导入本机应用：${app.appName}")
+        }
+    }
+
+    /** 整机备份导出：把 `.nvmbak`（ZIP）写入用户选择的 URI。 */
+    fun exportVmBackup(vmId: String, uri: Uri) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val summary = onDisk {
+                val output = app.contentResolver.openOutputStream(uri)
+                    ?: error("无法写入备份文件")
+                output.use {
+                    backupManager.exportVmToZip(
+                        profile = profile,
+                        vmDir = app.vmRepository.vmDir(vmId),
+                        outputStream = it
+                    )
+                }
+            }
+            toast("备份已导出：${summary.fileCount} 个文件 · ${summary.totalBytes / 1024} KB")
+        }
+    }
+
+    /** 整机备份导入：从 `.nvmbak` 还原为一台新虚拟机。 */
+    fun importVmBackup(uri: Uri) {
+        io {
+            val imported = onDisk {
+                val input = app.contentResolver.openInputStream(uri)
+                    ?: error("无法读取备份文件")
+                input.use { backupManager.importVmFromZip(it, app.vmRepository) }
+            }
+            app.vmInstanceManager.refresh()
+            refresh()
+            selectVm(imported.id)
+            toast("已导入备份：${imported.displayName}")
+        }
+    }
+
+    /**
+     * Writes [text] to `shared/clipboard.txt`, the file the guest-side bridge
+     * polls so the VM clipboard follows the host clipboard.
+     */
+    fun syncHostClipboardToVm(vmId: String, text: String) {
+        io {
+            val target = onDisk {
+                app.transferManagerFor(vmId).importFile(
+                    input = text.toByteArray(Charsets.UTF_8).inputStream(),
+                    fileName = CLIPBOARD_FILE_NAME
+                )
+            }
+            app.vmInstanceManager.appendConsole(
+                vmId,
+                "[ OK ] clipboard synced to shared/${target.name}"
+            )
+            reloadSelected()
+            toast("已同步本机剪切板到虚拟机")
+        }
+    }
+
+    /** Applies [transform] to the stored profile and re-syncs every guest artifact. */
+    private fun saveFeatureConfig(
+        vmId: String,
+        message: String,
+        transform: (VmProfile) -> VmProfile
+    ) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val updated = transform(profile)
+            onDisk { app.vmRepository.update(updated) }
+            regenerateBootFiles(updated)
+            refresh()
+            reloadSelected()
+            toast(message)
+        }
+    }
+
+    /** Starts or stops [KeepAliveService] so it tracks the given profiles. */
+    private fun syncKeepAliveService(profiles: List<VmProfile>) {
+        val wanted = profiles.any { it.keepAlive.screenOffKeepAlive }
+        if (wanted) {
+            val running = _state.value.runtimes.values.count { it.isRunning }
+            KeepAliveService.start(app, running)
+        } else {
+            KeepAliveService.stop(app)
+        }
+    }
+
+    /** Manual 「停止挂机」 from the home banner / display HUD. */
+    fun stopKeepAliveService() {
+        KeepAliveService.stop(app)
+        toast("已停止息屏挂机")
     }
 
     // ------------------------------------------------------- virtual location

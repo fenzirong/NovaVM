@@ -4,6 +4,7 @@ import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.RootXposedConfig
 import com.novavm.app.data.VirtualLocationConfig
 import com.novavm.app.data.VmHardwareConfig
+import com.novavm.app.data.VmosFeatureBundle
 import com.novavm.app.data.VmRepository
 import java.io.File
 import java.io.IOException
@@ -235,13 +236,24 @@ class RootXposedConfigurator(private val vmDir: File) {
         }
     }
 
-    /** Writes both generated files and returns them in write order. */
+    /**
+     * Writes both generated boot files.
+     *
+     * When [vmos] is supplied the VMOS-parity extension script
+     * (`shared/novavm_vmos_ext.sh`) is regenerated in the same pass and appended
+     * to the returned list, so the guest never boots with a stale GMS / sensor /
+     * keep-alive config.
+     *
+     * @return the written files in write order: boot script, init rc, and the
+     *   extension script when [vmos] is non-null.
+     */
     fun writeAll(
         config: RootXposedConfig,
         spoof: DeviceSpoofConfig,
         hardware: VmHardwareConfig = VmHardwareConfig(),
         profileName: String = "",
-        virtualLocation: VirtualLocationConfig = VirtualLocationConfig()
+        virtualLocation: VirtualLocationConfig = VirtualLocationConfig(),
+        vmos: VmosFeatureBundle? = null
     ): List<File> {
         ensureDirectories()
         bootScriptFile.writeText(
@@ -253,7 +265,17 @@ class RootXposedConfigurator(private val vmDir: File) {
             buildInitRc(config, spoof, hardware, profileName, virtualLocation),
             StandardCharsets.UTF_8
         )
-        return listOf(bootScriptFile, initRcFile)
+        val written = mutableListOf(bootScriptFile, initRcFile)
+        if (vmos != null) {
+            written += VmosFeatureInjector.writeExtensionScript(
+                vmDir = vmDir,
+                gms = vmos.gms,
+                sensors = vmos.sensors,
+                identity = vmos.identity,
+                keepAlive = vmos.keepAlive
+            )
+        }
+        return written
     }
 
     // -------------------------------------------------------------- modules

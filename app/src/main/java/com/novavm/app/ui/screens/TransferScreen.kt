@@ -4,6 +4,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,17 +20,21 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -39,8 +45,11 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,6 +65,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.novavm.app.transfer.HostAppInfo
 import com.novavm.app.transfer.SharedFileInfo
 import com.novavm.app.ui.NovaUiState
 import com.novavm.app.ui.NovaVmViewModel
@@ -74,6 +84,29 @@ fun TransferScreen(
     var menuOpen by remember { mutableStateOf(false) }
     var exportTarget by remember { mutableStateOf<String?>(null) }
     val clipboard = LocalClipboardManager.current
+
+    /** 0 = 「文件与 APK」, 1 = 「导入本机应用」. */
+    var segment by remember { mutableStateOf(0) }
+    var appQuery by remember { mutableStateOf("") }
+    var includeSystemApps by remember { mutableStateOf(false) }
+    val hostApps by vm.hostApps.collectAsState()
+
+    LaunchedEffect(includeSystemApps) {
+        vm.refreshHostApps(includeSystemApps)
+    }
+
+    // Computed in the composable body: LazyListScope itself is not composable.
+    val filteredHostApps = remember(hostApps, appQuery) {
+        val key = appQuery.trim()
+        if (key.isEmpty()) {
+            hostApps
+        } else {
+            hostApps.filter {
+                it.appName.contains(key, ignoreCase = true) ||
+                    it.packageName.contains(key, ignoreCase = true)
+            }
+        }
+    }
 
     val importPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -203,6 +236,107 @@ fun TransferScreen(
             }
         } else {
             item {
+                SegmentToggle(
+                    selected = segment,
+                    onSelect = { segment = it }
+                )
+            }
+        }
+
+        if (profile != null && segment == 1) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = NovaPalette.Surface),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, NovaPalette.Border.copy(alpha = 0.6f), RoundedCornerShape(14.dp))
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        OutlinedTextField(
+                            value = appQuery,
+                            onValueChange = { appQuery = it },
+                            singleLine = true,
+                            label = { Text("搜索本机应用", fontSize = 11.sp) },
+                            leadingIcon = {
+                                Icon(
+                                    Icons.Default.Search,
+                                    contentDescription = null,
+                                    tint = NovaPalette.TextMuted,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = { vm.refreshHostApps(includeSystemApps) },
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Refresh,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text("刷新列表", fontSize = 11.sp)
+                            }
+                            OutlinedButton(
+                                onClick = { includeSystemApps = !includeSystemApps },
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text(
+                                    text = if (includeSystemApps) "含系统应用" else "仅用户应用",
+                                    fontSize = 11.sp,
+                                    color = if (includeSystemApps) NovaPalette.Cyan else NovaPalette.TextSecondary
+                                )
+                            }
+                            NovaTag("${hostApps.size} 个应用", NovaPalette.Violet)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "APK 会被复制到 shared/apks/<包名>.apk，客户机可直接安装。",
+                            color = NovaPalette.TextMuted,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+
+            val filtered = filteredHostApps
+
+            if (filtered.isEmpty()) {
+                item {
+                    Text(
+                        text = if (hostApps.isEmpty()) {
+                            "未读取到本机应用。可点击「刷新列表」，或打开「含系统应用」再试一次。"
+                        } else {
+                            "没有匹配「$appQuery」的应用。"
+                        },
+                        color = NovaPalette.TextMuted,
+                        fontSize = 12.sp
+                    )
+                }
+            } else {
+                items(filtered, key = { "${it.packageName}#${it.apkPath}" }) { hostApp ->
+                    HostAppRow(
+                        hostApp = hostApp,
+                        onImport = { vm.importHostAppToVm(profile.id, hostApp) }
+                    )
+                }
+            }
+        }
+
+        if (profile != null && segment == 0) {
+            item {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Button(
                         onClick = { importPicker.launch(arrayOf("*/*")) },
@@ -230,6 +364,36 @@ fun TransferScreen(
                         Spacer(Modifier.width(6.dp))
                         Text("推送 APK", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     }
+                }
+            }
+
+            item {
+                val hostClipboard = clipboard.getText()?.text.orEmpty()
+                Button(
+                    onClick = { vm.syncHostClipboardToVm(profile.id, hostClipboard) },
+                    enabled = hostClipboard.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NovaPalette.Emerald.copy(alpha = 0.9f),
+                        contentColor = Color(0xFF04140E)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        Icons.Default.ContentPaste,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (hostClipboard.isBlank()) {
+                            "同步本机剪切板到虚拟机（当前剪切板为空）"
+                        } else {
+                            "同步本机剪切板到虚拟机"
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
 
@@ -333,6 +497,116 @@ fun TransferScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SegmentToggle(selected: Int, onSelect: (Int) -> Unit) {
+    val labels = listOf("文件与 APK", "导入本机应用")
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(NovaPalette.SurfaceMuted.copy(alpha = 0.5f))
+            .border(1.dp, NovaPalette.Border.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+            .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        labels.forEachIndexed { index, label ->
+            val active = selected == index
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(
+                        if (active) NovaPalette.Cyan.copy(alpha = 0.18f) else Color.Transparent
+                    )
+                    .border(
+                        1.dp,
+                        if (active) NovaPalette.Cyan.copy(alpha = 0.55f) else Color.Transparent,
+                        RoundedCornerShape(9.dp)
+                    )
+                    .clickable { onSelect(index) }
+                    .padding(vertical = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = label,
+                    color = if (active) NovaPalette.Cyan else NovaPalette.TextSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HostAppRow(hostApp: HostAppInfo, onImport: () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = NovaPalette.Surface),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, NovaPalette.Border.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(NovaPalette.SurfaceMuted),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Android,
+                    contentDescription = null,
+                    tint = NovaPalette.Violet,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = hostApp.appName,
+                    color = NovaPalette.TextPrimary,
+                    fontSize = 13.sp,
+                    maxLines = 1
+                )
+                Text(
+                    text = hostApp.packageName,
+                    color = NovaPalette.TextMuted,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1
+                )
+                Text(
+                    text = "版本 ${hostApp.versionName.ifBlank { "未知" }} · " +
+                        formatBytes(hostApp.apkSizeBytes) +
+                        if (hostApp.isSystemApp) " · 系统应用" else "",
+                    color = NovaPalette.TextSecondary,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = onImport,
+                enabled = hostApp.isExtractable,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NovaPalette.Cyan,
+                    contentColor = Color(0xFF04121C)
+                ),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+            ) {
+                Text("导入", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }

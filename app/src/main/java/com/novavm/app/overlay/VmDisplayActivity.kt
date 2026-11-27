@@ -2,6 +2,7 @@ package com.novavm.app.overlay
 
 import android.app.PictureInPictureParams
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.media.AudioManager
 import android.os.Build
@@ -49,10 +50,13 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.automirrored.filled.VolumeDown
@@ -122,6 +126,8 @@ class VmDisplayActivity : ComponentActivity() {
     private var sourceLabel by mutableStateOf("启动控制台")
     private var backendLabel by mutableStateOf("QEMU")
     private var paused by mutableStateOf(false)
+    private var keepAliveActive by mutableStateOf(false)
+    private var landscapeLocked by mutableStateOf(false)
 
     // Floating GPS joystick state, mirrored into Compose so nudges repaint live.
     private var gpsPadVisible by mutableStateOf(false)
@@ -154,6 +160,12 @@ class VmDisplayActivity : ComponentActivity() {
         gpsLongitude = loaded.virtualLocation.longitude
         gpsPadVisible = loaded.virtualLocation.enabled
         routeAvailable = loaded.virtualLocation.routeWaypoints.size >= 2
+        keepAliveActive = KeepAliveService.isRunning.value
+        // 「默认横屏锁定」 already saved on the profile wins over the manifest default.
+        if (loaded.keepAlive.landscapeLocked) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            landscapeLocked = true
+        }
 
         val runtime = application.vmInstanceManager.state(loaded.id)
         if (runtime?.isRunning != true) {
@@ -257,6 +269,11 @@ class VmDisplayActivity : ComponentActivity() {
                     onToggleRoute = { toggleRouteSimulation() },
                     onPauseResume = { togglePause() },
                     onSnapshot = { takeSnapshot() },
+                    onScreenshot = { captureScreenshot() },
+                    onRotate = { toggleRotation() },
+                    onToggleKeepAlive = { toggleKeepAlive() },
+                    keepAliveActive = keepAliveActive,
+                    landscapeLocked = landscapeLocked,
                     onNavBack = { sendKeysym(RfbProtocol.KEYSYM_ESCAPE) },
                     onNavHome = { consoleInput("home") },
                     onNavRecents = { consoleInput("recents") },
@@ -345,6 +362,74 @@ class VmDisplayActivity : ComponentActivity() {
         pipeline?.appendConsole(
             if (snapshot != null) "[ OK ] snapshot ${snapshot.name}" else "[FAIL] snapshot failed"
         )
+    }
+
+    /**
+     * 「截屏」：把当前帧缓冲（客户机 RFB 或启动控制台）编码成 PNG 存进相册。
+     */
+    private fun captureScreenshot() {
+        val display = pipeline ?: return
+        val frame = display.captureCurrentFrameRgba()
+        if (frame == null) {
+            Toast.makeText(this, "当前没有可截取的画面", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val (bytes, frameWidth, frameHeight) = frame
+        val vmName = profile?.displayName ?: "NovaVM"
+        VmScreenshotHelper.captureToGalleryOrAppDir(
+            context = this,
+            vmName = vmName,
+            rgbaBytes = bytes,
+            width = frameWidth,
+            height = frameHeight
+        ).fold(
+            onSuccess = { saved ->
+                Toast.makeText(this, "截图已保存：$saved", Toast.LENGTH_LONG).show()
+                display.appendConsole("[ OK ] screenshot saved ($frameWidth x $frameHeight)")
+            },
+            onFailure = { error ->
+                Toast.makeText(
+                    this,
+                    "截图失败：${error.message ?: error.javaClass.simpleName}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        )
+    }
+
+    /** 「旋转」：在横屏与竖屏之间切换 HUD 方向。 */
+    private fun toggleRotation() {
+        val next = if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+        requestedOrientation = next
+        landscapeLocked = next == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        Toast.makeText(
+            this,
+            if (landscapeLocked) "已切换为横屏" else "已切换为竖屏",
+            Toast.LENGTH_SHORT
+        ).show()
+        pipeline?.appendConsole(
+            "[ .. ] orientation -> ${if (landscapeLocked) "landscape" else "portrait"}"
+        )
+    }
+
+    /** 「挂机」：开关 [KeepAliveService]，让虚拟机在息屏后继续运行。 */
+    private fun toggleKeepAlive() {
+        val running = KeepAliveService.isRunning.value
+        if (running) {
+            KeepAliveService.stop(this)
+            keepAliveActive = false
+            Toast.makeText(this, "已停止息屏挂机", Toast.LENGTH_SHORT).show()
+            pipeline?.appendConsole("[ .. ] screen-off keep-alive stopped")
+        } else {
+            KeepAliveService.start(this, 1)
+            keepAliveActive = true
+            Toast.makeText(this, "已开启息屏挂机", Toast.LENGTH_SHORT).show()
+            pipeline?.appendConsole("[ OK ] screen-off keep-alive started")
+        }
     }
 
     private fun sendKeysym(keysym: Int) {
@@ -439,7 +524,8 @@ class VmDisplayActivity : ComponentActivity() {
                     updated.deviceSpoof,
                     updated.hardware,
                     updated.name,
-                    updated.virtualLocation
+                    updated.virtualLocation,
+                    updated.vmosBundle()
                 )
             }
             application.vmInstanceManager.syncVirtualLocation(loaded.id, "display-joystick")
@@ -543,6 +629,11 @@ private fun VmDisplayScreen(
     onToggleRoute: () -> Unit,
     onPauseResume: () -> Unit,
     onSnapshot: () -> Unit,
+    onScreenshot: () -> Unit,
+    onRotate: () -> Unit,
+    onToggleKeepAlive: () -> Unit,
+    keepAliveActive: Boolean,
+    landscapeLocked: Boolean,
     onNavBack: () -> Unit,
     onNavHome: () -> Unit,
     onNavRecents: () -> Unit,
@@ -655,7 +746,12 @@ private fun VmDisplayScreen(
                     onTransfer = onTransfer,
                     onPower = onPower,
                     gpsPadVisible = gpsPadVisible,
-                    onToggleGpsPad = onToggleGpsPad
+                    onToggleGpsPad = onToggleGpsPad,
+                    onScreenshot = onScreenshot,
+                    onRotate = onRotate,
+                    onToggleKeepAlive = onToggleKeepAlive,
+                    keepAliveActive = keepAliveActive,
+                    landscapeLocked = landscapeLocked
                 )
             }
         }
@@ -784,7 +880,12 @@ private fun HudBottomBar(
     onTransfer: () -> Unit,
     onPower: () -> Unit,
     gpsPadVisible: Boolean,
-    onToggleGpsPad: () -> Unit
+    onToggleGpsPad: () -> Unit,
+    onScreenshot: () -> Unit,
+    onRotate: () -> Unit,
+    onToggleKeepAlive: () -> Unit,
+    keepAliveActive: Boolean,
+    landscapeLocked: Boolean
 ) {
     Row(
         modifier = Modifier
@@ -810,6 +911,19 @@ private fun HudBottomBar(
             onClick = onToggleGpsPad
         )
         HudNavItem(Icons.Default.SwapHoriz, "互传", NovaPalette.Emerald, onTransfer)
+        HudNavItem(Icons.Default.PhotoCamera, "截屏", NovaPalette.Cyan, onScreenshot)
+        HudNavItem(
+            icon = Icons.Default.ScreenRotation,
+            label = "旋转",
+            tint = if (landscapeLocked) NovaPalette.Amber else NovaPalette.TextSecondary,
+            onClick = onRotate
+        )
+        HudNavItem(
+            icon = Icons.Default.Bedtime,
+            label = "挂机",
+            tint = if (keepAliveActive) NovaPalette.Emerald else NovaPalette.TextSecondary,
+            onClick = onToggleKeepAlive
+        )
         HudNavItem(Icons.Default.PowerSettingsNew, "关机", NovaPalette.Coral, onPower)
     }
 }

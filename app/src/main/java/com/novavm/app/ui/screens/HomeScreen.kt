@@ -1,5 +1,7 @@
 package com.novavm.app.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,15 +21,18 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SettingsBackupRestore
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -36,10 +41,12 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,6 +58,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.novavm.app.data.VmProfile
@@ -64,6 +73,13 @@ import com.novavm.app.ui.components.SectionTitle
 import com.novavm.app.ui.components.StatusPill
 import com.novavm.app.ui.theme.NovaPalette
 
+/** A locked VM action waiting for the 4–6 digit privacy PIN. */
+private data class PinPrompt(
+    val vmId: String,
+    val vmName: String,
+    val action: () -> Unit
+)
+
 @Composable
 fun HomeScreen(
     state: NovaUiState,
@@ -73,6 +89,24 @@ fun HomeScreen(
     onOpenSettings: (String) -> Unit,
     onOpenFloating: (String) -> Unit
 ) {
+    val keepAliveRunning by vm.keepAliveRunning.collectAsState()
+    var pinPrompt by remember { mutableStateOf<PinPrompt?>(null) }
+
+    val backupPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) vm.importVmBackup(uri)
+    }
+
+    /** Runs [action] directly, or behind the privacy PIN when the VM is locked. */
+    fun gated(profile: VmProfile, action: () -> Unit) {
+        if (profile.privacyLock.enabled) {
+            pinPrompt = PinPrompt(profile.id, profile.displayName, action)
+        } else {
+            action()
+        }
+    }
+
     Scaffold(
         containerColor = NovaPalette.Background,
         floatingActionButton = {
@@ -97,7 +131,26 @@ fun HomeScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            item { Header(onRefresh = vm::refresh) }
+            item {
+                Header(
+                    onRefresh = vm::refresh,
+                    onImportBackup = {
+                        backupPicker.launch(
+                            arrayOf(
+                                "application/octet-stream",
+                                "application/zip",
+                                "application/x-zip-compressed",
+                                "*/*"
+                            )
+                        )
+                    }
+                )
+            }
+            if (keepAliveRunning) {
+                item {
+                    KeepAliveBanner(onStop = vm::stopKeepAliveService)
+                }
+            }
             item {
                 CapabilityCard(
                     state = state,
@@ -124,10 +177,10 @@ fun HomeScreen(
                     VmInstanceCard(
                         profile = profile,
                         state = state,
-                        onToggleRun = { vm.toggleRunning(profile.id) },
-                        onOpenDisplay = { onOpenDisplay(profile.id) },
-                        onFloating = { onOpenFloating(profile.id) },
-                        onSettings = { onOpenSettings(profile.id) },
+                        onToggleRun = { gated(profile) { vm.toggleRunning(profile.id) } },
+                        onOpenDisplay = { gated(profile) { onOpenDisplay(profile.id) } },
+                        onFloating = { gated(profile) { onOpenFloating(profile.id) } },
+                        onSettings = { gated(profile) { onOpenSettings(profile.id) } },
                         onClone = { vm.cloneVm(profile.id) },
                         onDelete = { vm.deleteVm(profile.id) }
                     )
@@ -135,10 +188,118 @@ fun HomeScreen(
             }
         }
     }
+
+    pinPrompt?.let { prompt ->
+        PrivacyPinDialog(
+            vmName = prompt.vmName,
+            onDismiss = { pinPrompt = null },
+            onVerified = { pin ->
+                val unlocked = vm.verifyPrivacyPin(prompt.vmId, pin)
+                if (unlocked) {
+                    pinPrompt = null
+                    prompt.action()
+                }
+                unlocked
+            }
+        )
+    }
 }
 
 @Composable
-private fun Header(onRefresh: () -> Unit) {
+private fun KeepAliveBanner(onStop: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(NovaPalette.Emerald.copy(alpha = 0.14f))
+            .border(1.dp, NovaPalette.Emerald.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .clip(RoundedCornerShape(999.dp))
+                .background(NovaPalette.Emerald)
+        )
+        Spacer(Modifier.width(8.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = "息屏挂机中",
+                color = NovaPalette.Emerald,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "屏幕关闭后虚拟机继续运行",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+        }
+        TextButton(onClick = onStop) {
+            Text("停止挂机", color = NovaPalette.Coral, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+private fun PrivacyPinDialog(
+    vmName: String,
+    onDismiss: () -> Unit,
+    onVerified: (String) -> Boolean
+) {
+    var pin by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("隐私密码解锁") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "「$vmName」已启用隐私锁，请输入 4-6 位数字密码。",
+                    color = NovaPalette.TextSecondary,
+                    fontSize = 12.sp
+                )
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { input ->
+                        pin = input.filter { it.isDigit() }.take(6)
+                        error = null
+                    },
+                    label = { Text("隐私密码") },
+                    singleLine = true,
+                    isError = error != null,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (error != null) {
+                    Text(text = error.orEmpty(), color = NovaPalette.Coral, fontSize = 11.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                when {
+                    pin.length < 4 -> error = "请输入 4-6 位数字密码"
+                    onVerified(pin) -> Unit
+                    else -> {
+                        error = "密码错误，请重试"
+                        pin = ""
+                    }
+                }
+            }) { Text("解锁", color = NovaPalette.Cyan) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+        containerColor = NovaPalette.SurfaceElevated
+    )
+}
+
+@Composable
+private fun Header(onRefresh: () -> Unit, onImportBackup: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
@@ -159,6 +320,13 @@ private fun Header(onRefresh: () -> Unit) {
                 fontFamily = FontFamily.Monospace
             )
         }
+        ActionChip(
+            icon = Icons.Default.SettingsBackupRestore,
+            label = "导入备份",
+            accent = NovaPalette.Cyan,
+            onClick = onImportBackup
+        )
+        Spacer(Modifier.width(4.dp))
         IconButton(onClick = onRefresh) {
             Icon(
                 imageVector = Icons.Default.Refresh,
@@ -367,7 +535,10 @@ private fun VmInstanceCard(
             }
 
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 NovaTag(
                     text = if (profile.rootXposed.rootEnabled) "ROOT" else "未 Root",
                     color = if (profile.rootXposed.rootEnabled) NovaPalette.Emerald else NovaPalette.TextMuted
@@ -382,6 +553,15 @@ private fun VmInstanceCard(
                 )
                 if (profile.virtualLocation.enabled) {
                     NovaTag(text = "GPS", color = NovaPalette.Emerald)
+                }
+                if (profile.gms.enabled) {
+                    NovaTag(text = if (profile.gms.microGMode) "GMS · MicroG" else "GMS", NovaPalette.Cyan)
+                }
+                if (profile.privacyLock.enabled) {
+                    NovaTag(text = "隐私锁", color = NovaPalette.Amber)
+                }
+                if (profile.keepAlive.screenOffKeepAlive) {
+                    NovaTag(text = "挂机", color = NovaPalette.Violet)
                 }
             }
 
