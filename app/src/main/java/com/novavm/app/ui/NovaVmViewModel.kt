@@ -10,12 +10,15 @@ import androidx.lifecycle.viewModelScope
 import com.novavm.app.NovaVmApp
 import com.novavm.app.data.BackgroundKeepAliveConfig
 import com.novavm.app.data.DeviceSpoofConfig
+import com.novavm.app.data.DownloadStatus
 import com.novavm.app.data.GeoPoint
 import com.novavm.app.data.GmsConfig
 import com.novavm.app.data.ImportedRom
 import com.novavm.app.data.OneKeyNewDeviceGenerator
 import com.novavm.app.data.PinHashUtil
+import com.novavm.app.data.PortForwardRule
 import com.novavm.app.data.RomCatalogItem
+import com.novavm.app.data.RomDownloadState
 import com.novavm.app.data.RootXposedConfig
 import com.novavm.app.data.RouteLoopMode
 import com.novavm.app.data.VirtualLocationConfig
@@ -27,10 +30,17 @@ import com.novavm.app.data.VmBackupManager
 import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmPrivacyLockConfig
 import com.novavm.app.data.VmProfile
+import com.novavm.app.data.VmRepository
 import com.novavm.app.engine.DiskImageInfo
 import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.NativeEngine
+import com.novavm.app.engine.QmpConsoleEntry
+import com.novavm.app.engine.QmpTerminalController
+import com.novavm.app.engine.RuntimeSetupManager
+import com.novavm.app.engine.RuntimeStatus
 import com.novavm.app.engine.VmRuntimeState
+import com.novavm.app.engine.VmStorageStats
+import com.novavm.app.engine.VmTelemetryMonitor
 import com.novavm.app.location.GeoMath
 import com.novavm.app.location.RoutePlaybackState
 import com.novavm.app.overlay.KeepAliveService
@@ -47,6 +57,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
 /** Transient user-facing message rendered as a snackbar. */
@@ -110,6 +121,9 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
 
         const val PRIVACY_PIN_MIN_LENGTH = 4
         const val PRIVACY_PIN_MAX_LENGTH = 6
+
+        /** 每台虚拟机保留的 QMP 控制台行数上限（防止长时间使用后无限增长）。 */
+        const val QMP_HISTORY_LIMIT = 200
     }
 
     private val _state = MutableStateFlow(
@@ -125,8 +139,34 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
     val routePlaybackStates: StateFlow<Map<String, RoutePlaybackState>> =
         app.routeSimulator.playbackStates
 
+    // ------------------------------------------- 运行时 / 下载 / 控制台状态
+
+    /** QEMU 运行时组件的安装快照，由 [refreshRuntimeStatus] 刷新。 */
+    private val _runtimeStatus = MutableStateFlow(
+        RuntimeStatus(
+            qemuAarch64Path = null,
+            qemuX86_64Path = null,
+            qemuImgPath = null,
+            uefiArm64Path = null,
+            totalRuntimeBytes = 0L
+        )
+    )
+    val runtimeStatus: StateFlow<RuntimeStatus> = _runtimeStatus.asStateFlow()
+
+    /** 目录镜像下载进度，键为 [RomCatalogItem.id]。 */
+    val romDownloads: StateFlow<Map<String, RomDownloadState>> = app.romDownloader.downloads
+
+    /** 每台虚拟机的 QMP/HMP 控制台历史，最新的在末尾。 */
+    private val _qmpHistory = MutableStateFlow<Map<String, List<QmpConsoleEntry>>>(emptyMap())
+    val qmpHistory: StateFlow<Map<String, List<QmpConsoleEntry>>> = _qmpHistory.asStateFlow()
+
+    /** 每台虚拟机最近一次存储遥测结果。 */
+    private val _storageStats = MutableStateFlow<Map<String, VmStorageStats>>(emptyMap())
+    val storageStats: StateFlow<Map<String, VmStorageStats>> = _storageStats.asStateFlow()
+
     init {
         refresh()
+        viewModelScope.launch { trackRomDownloads() }
         viewModelScope.launch {
             app.vmInstanceManager.states.collect { states ->
                 _state.update { it.copy(runtimes = states.associateBy { state -> state.vmId }) }
@@ -307,6 +347,9 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
             if (_state.value.selectedVmId == vmId) {
                 _state.update { it.copy(selectedVmId = null, sharedFiles = emptyList(), consoleLog = emptyList()) }
             }
+            // 控制台历史与遥测属于已消失的虚拟机，一并丢弃避免内存泄漏。
+            _qmpHistory.update { it - vmId }
+            _storageStats.update { it - vmId }
             refresh()
             toast(if (removed) "虚拟机已删除" else "删除失败", isError = !removed)
         }
@@ -957,6 +1000,219 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
             val deleted = onDisk { app.romRepository.delete(romId) }
             refresh()
             toast(if (deleted) "镜像已删除" else "镜像删除失败", isError = !deleted)
+        }
+    }
+
+    // --------------------------------------------------------- 运行时环境
+
+    /** 重新扫描 `runtime/bin` 与 `runtime/firmware`，刷新四个组件状态。 */
+    fun refreshRuntimeStatus() {
+        io { inspectRuntime() }
+    }
+
+    /** 读取一次运行时状态并同步到 [runtimeStatus]；失败时退回“全部未导入”。 */
+    private suspend fun inspectRuntime(): RuntimeStatus {
+        val status = onDisk { runCatching { app.runtimeSetupManager.inspect() } }
+            .getOrElse {
+                RuntimeStatus(
+                    qemuAarch64Path = null,
+                    qemuX86_64Path = null,
+                    qemuImgPath = null,
+                    uefiArm64Path = null,
+                    totalRuntimeBytes = 0L
+                )
+            }
+        _runtimeStatus.value = status
+        return status
+    }
+
+    /** 导入运行时 `.zip` 包；白名单与 Zip-Slip 防护由安装器负责。 */
+    fun importRuntimeZip(uri: Uri) {
+        _state.update { it.copy(loading = true) }
+        io {
+            try {
+                val created = onDisk {
+                    val input = app.contentResolver.openInputStream(uri)
+                        ?: error("无法读取所选运行时压缩包")
+                    // `use {}` 保证 SAF 描述符一定被释放，导入失败也不泄漏 fd。
+                    input.use { app.runtimeSetupManager.importRuntimeArchive(it) }
+                }
+                inspectRuntime()
+                toast(
+                    text = if (created.isEmpty()) {
+                        "压缩包内没有可识别的运行时组件"
+                    } else {
+                        "已导入 ${created.size} 个运行时组件"
+                    },
+                    isError = created.isEmpty()
+                )
+            } finally {
+                _state.update { it.copy(loading = false) }
+            }
+        }
+    }
+
+    /** 导入单个 QEMU 可执行文件或 UEFI 固件；[targetName] 必须在白名单内。 */
+    fun importQemuBinary(uri: Uri, targetName: String) {
+        val name = targetName.trim()
+        if (name !in RuntimeSetupManager.ALLOWED_NAMES) {
+            toast("不支持的运行时文件名：${name.ifBlank { "（空）" }}", isError = true)
+            return
+        }
+        _state.update { it.copy(loading = true) }
+        io {
+            try {
+                val target = onDisk {
+                    val input = app.contentResolver.openInputStream(uri)
+                        ?: error("无法读取所选文件")
+                    input.use { app.runtimeSetupManager.importBinary(it, name) }
+                }
+                inspectRuntime()
+                toast("已导入 ${target.name}")
+            } finally {
+                _state.update { it.copy(loading = false) }
+            }
+        }
+    }
+
+    // --------------------------------------------------------- 镜像下载
+
+    /** 开始（或续传）下载目录镜像，完成后自动登记进镜像库。 */
+    fun startRomDownload(item: RomCatalogItem) {
+        app.romDownloader.startDownload(item, app.romRepository)
+    }
+
+    /** 取消下载并丢弃未完成的残片。 */
+    fun cancelRomDownload(catalogId: String) {
+        app.romDownloader.cancel(catalogId)
+    }
+
+    /** 下载完成时把新镜像并入 UI 列表，用户无需再手动导入。 */
+    private suspend fun trackRomDownloads() {
+        val handled = mutableSetOf<String>()
+        app.romDownloader.downloads.collect { downloads ->
+            val finished = downloads
+                .filterValues { it.status == DownloadStatus.COMPLETED }
+                .keys
+                .filterNot { it in handled }
+            if (finished.isEmpty()) return@collect
+            handled += finished
+            refreshImportedRoms()
+        }
+    }
+
+    private suspend fun refreshImportedRoms() {
+        val roms = onDisk { app.romRepository.imported() }
+        val probes = onDisk {
+            roms.associate { rom -> rom.id to NativeEngine.probeDiskImage(rom.absolutePath) }
+        }
+        _state.update { it.copy(importedRoms = roms, romProbes = probes) }
+    }
+
+    // --------------------------------------------------------- 端口转发
+
+    /** 新增一条端口转发规则；同名 id 视为覆盖并重新启用。 */
+    fun addPortForward(vmId: String, rule: PortForwardRule) {
+        val invalid = rule.validationMessage()
+        if (invalid != null) {
+            toast(invalid, isError = true)
+            return
+        }
+        mutatePortForwards(vmId, "已添加端口转发：${rule.label}") { rules ->
+            if (rules.any { it.id == rule.id }) {
+                rules.map { existing ->
+                    if (existing.id == rule.id) rule.copy(enabled = true) else existing
+                }
+            } else {
+                rules + rule
+            }
+        }
+    }
+
+    fun removePortForward(vmId: String, ruleId: String) {
+        mutatePortForwards(vmId, "已删除端口转发") { rules ->
+            rules.filterNot { it.id == ruleId }
+        }
+    }
+
+    fun togglePortForward(vmId: String, ruleId: String) {
+        mutatePortForwards(vmId, "端口转发状态已更新") { rules ->
+            rules.map { rule ->
+                if (rule.id == ruleId) rule.copy(enabled = !rule.enabled) else rule
+            }
+        }
+    }
+
+    /** 统一的规则改写入口：落盘、刷新列表与选中态。 */
+    private fun mutatePortForwards(
+        vmId: String,
+        message: String,
+        transform: (List<PortForwardRule>) -> List<PortForwardRule>
+    ) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val updated = profile.copy(portForwards = transform(profile.portForwards))
+            onDisk { app.vmRepository.update(updated) }
+            refresh()
+            if (_state.value.selectedVmId == vmId) reloadSelected()
+            toast(message)
+        }
+    }
+
+    // ------------------------------------------------- 端口转发 / QMP 控制台
+
+    /** 自定义规则使用的短 id（预设规则用 [com.novavm.app.data.PortForwardPresets] 的固定 id）。 */
+    fun newRuleId(): String = UUID.randomUUID().toString().take(8)
+
+    /**
+     * 执行一条 HMP 指令。
+     *
+     * 有真实 QEMU 进程时走 QMP 通道，否则 [QmpTerminalController] 返回带离线标记
+     * 的诊断；两种结果都会追加到 [qmpHistory]，供终端面板滚动查看。
+     */
+    fun executeQmpCommand(vmId: String, rawCommand: String) {
+        io {
+            val runtime = app.vmInstanceManager.state(vmId)
+            val live = runtime != null && runtime.isRunning && runtime.pid > 0
+            val qmpPort = onDisk { app.vmRepository.get(vmId)?.qmpPort }
+                ?: runtime?.qmpPort
+                ?: VmRepository.DEFAULT_QMP_PORT
+            val entry = onDisk {
+                app.qmpTerminalController.executeCommand(
+                    qmpPort = qmpPort,
+                    rawCommand = rawCommand,
+                    isVmRunningWithQemu = live
+                )
+            }
+            _qmpHistory.update { history ->
+                val existing = history[vmId].orEmpty()
+                history + (vmId to (existing + entry).takeLast(QMP_HISTORY_LIMIT))
+            }
+        }
+    }
+
+    // --------------------------------------------------------- 存储遥测
+
+    /** 重新统计虚拟机目录 / 磁盘镜像 / 共享目录 / 模块目录与快照数量。 */
+    fun refreshStorageStats(vmId: String) {
+        io {
+            val profile = onDisk { app.vmRepository.get(vmId) }
+            if (profile == null) {
+                toast("找不到该虚拟机", isError = true)
+                return@io
+            }
+            val stats = onDisk {
+                VmTelemetryMonitor.inspectVmStorage(
+                    vmDir = app.vmRepository.vmDir(vmId),
+                    diskImagePath = profile.diskImagePath,
+                    snapshotCount = profile.snapshots.size
+                )
+            }
+            _storageStats.update { it + (vmId to stats) }
         }
     }
 

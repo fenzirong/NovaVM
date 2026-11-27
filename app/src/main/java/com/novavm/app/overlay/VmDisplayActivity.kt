@@ -1,5 +1,6 @@
 package com.novavm.app.overlay
 
+import android.annotation.SuppressLint
 import android.app.PictureInPictureParams
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -47,6 +48,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
@@ -129,6 +131,9 @@ class VmDisplayActivity : ComponentActivity() {
     private var paused by mutableStateOf(false)
     private var keepAliveActive by mutableStateOf(false)
     private var landscapeLocked by mutableStateOf(false)
+
+    // 「键盘」HUD 开关：虚拟键盘条展开后，实体键不再被拦截，交给输入法处理。
+    private var keyboardVisible by mutableStateOf(false)
 
     // Floating GPS joystick state, mirrored into Compose so nudges repaint live.
     private var gpsPadVisible by mutableStateOf(false)
@@ -286,7 +291,13 @@ class VmDisplayActivity : ComponentActivity() {
                     routeAvailable = routeAvailable,
                     routePlaying = routePlaying,
                     routeProgress = routeProgress,
+                    keyboardVisible = keyboardVisible,
                     onToggleHud = { hudVisible = !hudVisible },
+                    onToggleKeyboard = { keyboardVisible = !keyboardVisible },
+                    onCloseKeyboard = { keyboardVisible = false },
+                    onSendKey = { keysym -> sendKeysym(keysym) },
+                    onSendText = { text -> sendText(text) },
+                    onSendCtrlAltDel = { sendCtrlAltDel() },
                     onToggleGpsPad = { gpsPadVisible = !gpsPadVisible },
                     onGpsNudge = { bearing -> nudgeGps(bearing) },
                     onToggleRoute = { toggleRouteSimulation() },
@@ -628,6 +639,72 @@ class VmDisplayActivity : ComponentActivity() {
 
     // ---------------------------------------------------------------- input
 
+    /**
+     * 把虚拟键盘条的「发送」文本逐字符注入客户机。
+     *
+     * 每个 keysym 都是一次 RFB KeyEvent 写操作，1080p 下几十个字符也足够卡住
+     * 主线程，所以整段序列放到 IO 线程；失败计数回到主线程给一次提示。
+     */
+    private fun sendText(text: String) {
+        val display = pipeline ?: return
+        val keysyms = HardwareInputMapper.textToKeysyms(text)
+        if (keysyms.isEmpty()) {
+            Toast.makeText(this, "没有可发送的字符", Toast.LENGTH_SHORT).show()
+            return
+        }
+        lifecycleScope.launch {
+            val delivered = withContext(Dispatchers.IO) {
+                keysyms.count { keysym -> display.sendKey(keysym) }
+            }
+            if (isFinishing || isDestroyed) return@launch
+            if (delivered == 0) {
+                Toast.makeText(this@VmDisplayActivity, "客户机尚未连接，字符未送达", Toast.LENGTH_SHORT).show()
+            }
+            display.appendConsole("[ .. ] text injected: $delivered/${keysyms.size} keysyms")
+        }
+    }
+
+    /** 经典 Ctrl+Alt+Del：修饰键与 DEL 依次按下并释放。 */
+    private fun sendCtrlAltDel() {
+        val display = pipeline ?: return
+        val chord = intArrayOf(
+            HardwareInputMapper.KEYSYM_CTRL_L,
+            HardwareInputMapper.KEYSYM_ALT_L,
+            HardwareInputMapper.KEYSYM_DELETE
+        )
+        lifecycleScope.launch(Dispatchers.IO) {
+            chord.forEach { keysym -> display.sendKey(keysym) }
+        }
+        display.appendConsole("[ .. ] Ctrl+Alt+Del sent")
+    }
+
+    /**
+     * 实体 / 蓝牙键盘透传。
+     *
+     * 虚拟键盘条的输入框打开时一律走默认分发，否则用户无法在输入框里打字；
+     * 音量键与返回键也始终交给系统，保证任何情况下都能退出或调节音量。
+     *
+     * `ComponentActivity.dispatchKeyEvent` 被标记为 `@RestrictTo`，但拦截按键
+     * 事件正是全屏客户机画面必须的能力，这里显式压制该检查。
+     */
+    @SuppressLint("RestrictedApi")
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (keyboardVisible || event.action != KeyEvent.ACTION_DOWN) {
+            return super.dispatchKeyEvent(event)
+        }
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_VOLUME_MUTE,
+            KeyEvent.KEYCODE_BACK -> return super.dispatchKeyEvent(event)
+            else -> Unit
+        }
+        val display = pipeline ?: return super.dispatchKeyEvent(event)
+        val keysym = HardwareInputMapper.androidKeyCodeToKeysym(event.keyCode, event.unicodeChar)
+            ?: return super.dispatchKeyEvent(event)
+        return if (display.sendKey(keysym)) true else super.dispatchKeyEvent(event)
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         val keysym = mapKeysym(keyCode, event) ?: return super.onKeyDown(keyCode, event)
         val display = pipeline ?: return super.onKeyDown(keyCode, event)
@@ -673,7 +750,13 @@ private fun VmDisplayScreen(
     routeAvailable: Boolean,
     routePlaying: Boolean,
     routeProgress: String,
+    keyboardVisible: Boolean,
     onToggleHud: () -> Unit,
+    onToggleKeyboard: () -> Unit,
+    onCloseKeyboard: () -> Unit,
+    onSendKey: (Int) -> Unit,
+    onSendText: (String) -> Unit,
+    onSendCtrlAltDel: () -> Unit,
     onToggleGpsPad: () -> Unit,
     onGpsNudge: (Double) -> Unit,
     onToggleRoute: () -> Unit,
@@ -801,7 +884,9 @@ private fun VmDisplayScreen(
                     onRotate = onRotate,
                     onToggleKeepAlive = onToggleKeepAlive,
                     keepAliveActive = keepAliveActive,
-                    landscapeLocked = landscapeLocked
+                    landscapeLocked = landscapeLocked,
+                    keyboardVisible = keyboardVisible,
+                    onToggleKeyboard = onToggleKeyboard
                 )
             }
         }
@@ -816,6 +901,22 @@ private fun VmDisplayScreen(
                     routePlaying = routePlaying,
                     routeProgress = routeProgress,
                     onToggleRoute = onToggleRoute
+                )
+            }
+        }
+
+        if (keyboardVisible && !isInPip) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 8.dp, end = 8.dp, bottom = 78.dp)
+            ) {
+                VirtualKeyboardBar(
+                    onSendKey = onSendKey,
+                    onSendText = onSendText,
+                    onSendCtrlAltDel = onSendCtrlAltDel,
+                    onClose = onCloseKeyboard
                 )
             }
         }
@@ -935,7 +1036,9 @@ private fun HudBottomBar(
     onRotate: () -> Unit,
     onToggleKeepAlive: () -> Unit,
     keepAliveActive: Boolean,
-    landscapeLocked: Boolean
+    landscapeLocked: Boolean,
+    keyboardVisible: Boolean,
+    onToggleKeyboard: () -> Unit
 ) {
     Row(
         modifier = Modifier
@@ -962,6 +1065,12 @@ private fun HudBottomBar(
         )
         HudNavItem(Icons.Default.SwapHoriz, "互传", NovaPalette.Emerald, onTransfer)
         HudNavItem(Icons.Default.PhotoCamera, "截屏", NovaPalette.Cyan, onScreenshot)
+        HudNavItem(
+            icon = Icons.Default.Keyboard,
+            label = "键盘",
+            tint = if (keyboardVisible) NovaPalette.Amber else NovaPalette.TextSecondary,
+            onClick = onToggleKeyboard
+        )
         HudNavItem(
             icon = Icons.Default.ScreenRotation,
             label = "旋转",

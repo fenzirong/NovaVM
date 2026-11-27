@@ -25,6 +25,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.ContentCopy
@@ -84,10 +85,13 @@ import com.novavm.app.data.BackgroundKeepAliveConfig
 import com.novavm.app.data.DevicePresets
 import com.novavm.app.data.DeviceSpoofConfig
 import com.novavm.app.data.DeviceSpoofGenerator
+import com.novavm.app.data.ForwardProtocol
 import com.novavm.app.data.GeoPoint
 import com.novavm.app.data.GmsConfig
 import com.novavm.app.data.GpuMode
 import com.novavm.app.data.LocationPresets
+import com.novavm.app.data.PortForwardPresets
+import com.novavm.app.data.PortForwardRule
 import com.novavm.app.data.RootXposedConfig
 import com.novavm.app.data.RouteLoopMode
 import com.novavm.app.data.VirtualLocationConfig
@@ -96,6 +100,10 @@ import com.novavm.app.data.VirtualSensorConfig
 import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmStatus
+import com.novavm.app.engine.QmpConsoleEntry
+import com.novavm.app.engine.QmpTerminalController
+import com.novavm.app.engine.VmStorageStats
+import com.novavm.app.engine.VmTelemetryMonitor
 import com.novavm.app.location.GeoMath
 import com.novavm.app.location.MapTileSource
 import com.novavm.app.location.RoutePlaybackState
@@ -108,6 +116,8 @@ import com.novavm.app.ui.components.MapInteractionMode
 import com.novavm.app.ui.components.NovaTag
 import com.novavm.app.ui.components.StatusPill
 import com.novavm.app.ui.theme.NovaPalette
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -118,7 +128,8 @@ private val detailTabs = listOf(
     "虚拟定位",
     "Root 与 Xposed",
     "VMOS 增强",
-    "快照与日志"
+    "快照与日志",
+    "终端与端口"
 )
 
 @Composable
@@ -248,7 +259,8 @@ fun VmDetailScreen(
             2 -> VirtualLocationTab(profile, state, vm)
             3 -> RootTab(profile, state, vm)
             4 -> VmosTab(profile, vm)
-            else -> SnapshotLogTab(profile, state, vm)
+            5 -> SnapshotLogTab(profile, state, vm)
+            else -> TerminalPortTab(profile, vm)
         }
     }
 }
@@ -1129,6 +1141,347 @@ private fun SnapshotLogTab(profile: VmProfile, state: NovaUiState, vm: NovaVmVie
             },
             containerColor = NovaPalette.SurfaceElevated
         )
+    }
+}
+
+// --------------------------------------------------------------- 终端与端口
+
+/** 终端面板一次渲染的最大行数（更早的历史仍保留在 ViewModel 中）。 */
+private const val QMP_VISIBLE_LINES = 30
+
+@Composable
+private fun TerminalPortTab(profile: VmProfile, vm: NovaVmViewModel) {
+    val storageStats by vm.storageStats.collectAsState()
+    val qmpHistory by vm.qmpHistory.collectAsState()
+
+    LaunchedEffect(profile.id) { vm.refreshStorageStats(profile.id) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        StorageTelemetryCard(
+            stats = storageStats[profile.id],
+            onRefresh = { vm.refreshStorageStats(profile.id) }
+        )
+        Spacer(Modifier.height(14.dp))
+        PortForwardCard(profile = profile, vm = vm)
+        Spacer(Modifier.height(14.dp))
+        QmpConsoleCard(
+            profile = profile,
+            history = qmpHistory[profile.id].orEmpty(),
+            vm = vm
+        )
+        Spacer(Modifier.height(40.dp))
+    }
+}
+
+@Composable
+private fun StorageTelemetryCard(stats: VmStorageStats?, onRefresh: () -> Unit) {
+    DetailFormCard("存储遥测") {
+        if (stats == null) {
+            Text(
+                text = "正在统计虚拟机目录…",
+                color = NovaPalette.TextMuted,
+                fontSize = 12.sp
+            )
+        } else {
+            TelemetryRow("虚拟机目录总大小", VmTelemetryMonitor.formatBytes(stats.vmDirBytes))
+            TelemetryRow("磁盘镜像大小", VmTelemetryMonitor.formatBytes(stats.diskImageBytes))
+            TelemetryRow("共享目录大小", VmTelemetryMonitor.formatBytes(stats.sharedDirBytes))
+            TelemetryRow("模块目录大小", VmTelemetryMonitor.formatBytes(stats.modulesDirBytes))
+            TelemetryRow("快照数量", "${stats.snapshotCount} 个")
+            if (stats.diskImageIsExternal) {
+                Text(
+                    text = "磁盘镜像位于虚拟机目录之外，镜像体积不计入目录总量。",
+                    color = NovaPalette.TextMuted,
+                    fontSize = 10.sp
+                )
+            }
+        }
+        OutlinedButton(onClick = onRefresh, shape = RoundedCornerShape(10.dp)) {
+            Icon(
+                imageVector = Icons.Default.Refresh,
+                contentDescription = null,
+                tint = NovaPalette.Cyan,
+                modifier = Modifier.size(15.dp)
+            )
+            Spacer(Modifier.width(6.dp))
+            Text("刷新", color = NovaPalette.Cyan, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun TelemetryRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            color = NovaPalette.TextSecondary,
+            fontSize = 12.sp,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = value,
+            color = NovaPalette.Cyan,
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun PortForwardCard(profile: VmProfile, vm: NovaVmViewModel) {
+    val context = LocalContext.current
+    var label by remember(profile.id) { mutableStateOf("") }
+    var protocol by remember(profile.id) { mutableStateOf(ForwardProtocol.TCP) }
+    var hostPort by remember(profile.id) { mutableStateOf("") }
+    var guestPort by remember(profile.id) { mutableStateOf("") }
+
+    val rules = profile.portForwards
+
+    DetailFormCard("自定义端口转发（${rules.size} 条）") {
+        Text(
+            text = "规则只绑定 127.0.0.1，不会把端口暴露到局域网；宿主机端口需 ≥ " +
+                "${PortForwardRule.MIN_HOST_PORT}（更低为系统保留）。修改后下次启动生效。",
+            color = NovaPalette.TextMuted,
+            fontSize = 10.sp
+        )
+
+        Text("预设快捷添加", color = NovaPalette.TextSecondary, fontSize = 12.sp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            CompactAction("SSH", NovaPalette.Cyan) {
+                vm.addPortForward(profile.id, PortForwardPresets.ssh(id = vm.newRuleId()))
+            }
+            CompactAction("HTTP", NovaPalette.Emerald) {
+                vm.addPortForward(profile.id, PortForwardPresets.http(id = vm.newRuleId()))
+            }
+            CompactAction("HTTPS", NovaPalette.Violet) {
+                vm.addPortForward(profile.id, PortForwardPresets.https(id = vm.newRuleId()))
+            }
+            CompactAction("Frida", NovaPalette.Amber) {
+                vm.addPortForward(profile.id, PortForwardPresets.frida(id = vm.newRuleId()))
+            }
+        }
+
+        Text("自定义规则", color = NovaPalette.TextSecondary, fontSize = 12.sp)
+        DetailTextField("标签（例如 SSH 调试）", label) { label = it }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ForwardProtocol.entries.forEach { entry ->
+                FilterChip(
+                    selected = protocol == entry,
+                    onClick = { protocol = entry },
+                    label = { Text(entry.displayName, fontSize = 11.sp) },
+                    colors = detailChipColors()
+                )
+            }
+        }
+        DetailTextField("宿主机端口（≥1024）", hostPort) {
+            hostPort = it.filter(Char::isDigit).take(5)
+        }
+        DetailTextField("虚拟机端口", guestPort) {
+            guestPort = it.filter(Char::isDigit).take(5)
+        }
+        Button(
+            onClick = {
+                val host = hostPort.toIntOrNull()
+                val guest = guestPort.toIntOrNull()
+                if (host == null || guest == null) {
+                    Toast.makeText(context, "请填写宿主机端口与虚拟机端口", Toast.LENGTH_SHORT).show()
+                    return@Button
+                }
+                vm.addPortForward(
+                    profile.id,
+                    PortForwardRule(
+                        id = vm.newRuleId(),
+                        label = label.ifBlank { "${protocol.displayName} $host → $guest" },
+                        protocol = protocol,
+                        hostPort = host,
+                        guestPort = guest
+                    )
+                )
+                label = ""
+                hostPort = ""
+                guestPort = ""
+            },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = NovaPalette.Cyan,
+                contentColor = Color(0xFF04121C)
+            ),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("添加转发规则", fontSize = 12.sp)
+        }
+
+        if (rules.isEmpty()) {
+            Text(
+                text = "尚未添加端口转发规则；新增的规则会立即写入 profile，并在下次启动时进入 QEMU 的 hostfwd 参数。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+        } else {
+            rules.forEach { rule ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = rule.label,
+                            color = NovaPalette.TextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = rule.summary(),
+                            color = if (rule.enabled) NovaPalette.Cyan else NovaPalette.TextMuted,
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 2
+                        )
+                        rule.validationMessage()?.let { message ->
+                            Text(text = message, color = NovaPalette.Coral, fontSize = 9.sp)
+                        }
+                    }
+                    Switch(
+                        checked = rule.enabled,
+                        onCheckedChange = { vm.togglePortForward(profile.id, rule.id) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color(0xFF04121C),
+                            checkedTrackColor = NovaPalette.Cyan,
+                            uncheckedTrackColor = NovaPalette.SurfaceMuted
+                        )
+                    )
+                    IconButton(onClick = { vm.removePortForward(profile.id, rule.id) }) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "删除规则",
+                            tint = NovaPalette.Coral,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QmpConsoleCard(
+    profile: VmProfile,
+    history: List<QmpConsoleEntry>,
+    vm: NovaVmViewModel
+) {
+    var command by remember(profile.id) { mutableStateOf("") }
+    val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.US) }
+    val submit = {
+        val raw = command
+        if (raw.isNotBlank()) {
+            vm.executeQmpCommand(profile.id, raw)
+            command = ""
+        }
+    }
+
+    DetailFormCard("QMP 监控终端") {
+        Text(
+            text = "指令以 human-monitor-command 形式下发；虚拟机未运行时切换为离线控制台，只回显将要发送的内容。",
+            color = NovaPalette.TextMuted,
+            fontSize = 10.sp
+        )
+
+        Text("快捷指令", color = NovaPalette.TextSecondary, fontSize = 12.sp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            QmpTerminalController.quickCommands.forEach { (chipLabel, hmp) ->
+                CompactAction(chipLabel, NovaPalette.Violet) {
+                    vm.executeQmpCommand(profile.id, hmp)
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = command,
+                onValueChange = { command = it },
+                label = { Text("HMP 指令（例如 info block）", fontSize = 11.sp) },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                ),
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(onClick = submit, shape = RoundedCornerShape(10.dp)) {
+                Text("执行", color = NovaPalette.Cyan, fontSize = 12.sp)
+            }
+        }
+
+        Text(
+            text = "终端历史（${history.size} 条）",
+            color = NovaPalette.TextSecondary,
+            fontSize = 12.sp
+        )
+        if (history.isEmpty()) {
+            Text(
+                text = "尚无指令记录；启动虚拟机后这里会显示真实 QEMU 输出。",
+                color = NovaPalette.TextMuted,
+                fontSize = 10.sp
+            )
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(NovaPalette.Background)
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                history.takeLast(QMP_VISIBLE_LINES).forEach { entry ->
+                    Text(
+                        text = entry.echoLine(),
+                        color = NovaPalette.Cyan,
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = entry.response.trimEnd(),
+                        color = if (entry.isError) NovaPalette.Coral else NovaPalette.TextSecondary,
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 12.sp
+                    )
+                    Text(
+                        text = timeFormat.format(Date(entry.timestampMs)),
+                        color = NovaPalette.TextMuted,
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+            }
+        }
     }
 }
 

@@ -77,11 +77,20 @@ class QemuBackend(private val logger: (String) -> Unit = {}) : VmBackend {
             args += listOf("-drive", drive)
         }
 
-        // User-mode networking with an ADB forward to the guest's 5555.
-        args += listOf(
-            "-netdev",
-            "user,id=net0,hostfwd=tcp:127.0.0.1:${profile.adbForwardPort}-:5555"
-        )
+        // User-mode networking with an ADB forward to the guest's 5555, plus every
+        // user-defined host → guest mapping stored on the profile. Disabled or
+        // out-of-range rules are dropped here so the argv can never carry a
+        // `hostfwd` clause QEMU would refuse to bind.
+        val netdev = buildString {
+            append("user,id=net0")
+            append(",hostfwd=tcp:127.0.0.1:")
+            append(profile.adbForwardPort)
+            append("-:5555")
+            profile.portForwards
+                .filter { it.enabled && it.isValid() }
+                .forEach { rule -> append(',').append(rule.toQemuHostFwdArg()) }
+        }
+        args += listOf("-netdev", netdev)
         args += listOf("-device", "virtio-net-pci,netdev=net0")
 
         // Shared folder over VirtIO-9p.

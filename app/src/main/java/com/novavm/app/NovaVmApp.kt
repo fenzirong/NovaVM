@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import com.novavm.app.data.DevicePresets
 import com.novavm.app.data.DeviceSpoofGenerator
+import com.novavm.app.data.RomDownloader
 import com.novavm.app.data.RomRepository
 import com.novavm.app.data.RootXposedConfig
 import com.novavm.app.data.VmArchitecture
@@ -12,6 +13,8 @@ import com.novavm.app.data.VmHardwareConfig
 import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmRepository
 import com.novavm.app.engine.HostCapabilities
+import com.novavm.app.engine.QmpTerminalController
+import com.novavm.app.engine.RuntimeSetupManager
 import com.novavm.app.engine.VmInstanceManager
 import com.novavm.app.location.RouteSimulator
 import com.novavm.app.location.VirtualGpsEngine
@@ -41,6 +44,26 @@ class NovaVmApp : Application() {
 
     val romRepository: RomRepository by lazy { RomRepository(storageRoot) }
 
+    /**
+     * QEMU 运行时组件（`runtime/bin` + `runtime/firmware`）的安装与导入。
+     *
+     * 根目录就是应用私有目录：[rootDir]/runtime/bin/qemu-system-aarch64 与
+     * [rootDir]/runtime/firmware/edk2-aarch64-code.fd，导入后的绝对路径会由
+     * [VmInstanceManager] 直接用作启动命令的首个参数。
+     */
+    val runtimeSetupManager: RuntimeSetupManager by lazy { RuntimeSetupManager(filesDir) }
+
+    /** 开源镜像目录下载器：断点续传、进度广播、完成后自动登记进镜像库。 */
+    val romDownloader: RomDownloader by lazy { RomDownloader() }
+
+    /**
+     * QMP / HMP 控制台桥接。
+     *
+     * [QmpTerminalController] 是无状态单例，这里只提供一个统一入口，让
+     * ViewModel 与界面不必各自持有引用。
+     */
+    val qmpTerminalController: QmpTerminalController get() = QmpTerminalController
+
     /** Mock GPS renderer shared by the ViewModel, the display HUD and tests. */
     val virtualGpsEngine: VirtualGpsEngine by lazy { VirtualGpsEngine() }
 
@@ -48,7 +71,8 @@ class NovaVmApp : Application() {
         VmInstanceManager(
             repository = vmRepository,
             capabilitiesProvider = { hostCapabilities },
-            virtualGps = virtualGpsEngine
+            virtualGps = virtualGpsEngine,
+            runtimeSetup = runtimeSetupManager
         ).also { manager ->
             runCatching { manager.refresh() }
         }

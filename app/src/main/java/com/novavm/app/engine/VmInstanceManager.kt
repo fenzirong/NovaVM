@@ -58,7 +58,13 @@ class VmInstanceManager(
     private val avfBackend: AvfBackend = AvfBackend(qemuBackend),
     private val virtualGps: VirtualGpsEngine = VirtualGpsEngine(),
     private val clock: () -> Long = System::currentTimeMillis,
-    private val consoleLimit: Int = 400
+    private val consoleLimit: Int = 400,
+    /**
+     * 可选的运行时安装器。传进来之后，`filesDir/runtime/bin/` 里用户自行导入的
+     * QEMU 可执行文件会被自动识别并作为启动命令的第一个参数；为空时退回按名称
+     * 从 PATH 解析（即原有行为，单元测试默认不受影响）。
+     */
+    private val runtimeSetup: RuntimeSetupManager? = null
 ) {
 
     private val lock = Any()
@@ -245,9 +251,20 @@ class VmInstanceManager(
             profile = profile,
             capabilities = capabilities,
             sharedDir = repository.sharedDir(vmId),
-            logDir = repository.logsDir(vmId)
+            logDir = repository.logsDir(vmId),
+            binaryPath = resolveQemuBinary(profile)
         )
     }
+
+    /**
+     * 用户导入的 QEMU 可执行文件绝对路径。
+     *
+     * 命中 `runtime/bin/qemu-system-<arch>` 时返回其绝对路径，这样启动命令不再
+     * 依赖 PATH；运行时尚未导入（或安装器未注入）时返回 null，[QemuBackend]
+     * 便退回按架构名解析。
+     */
+    fun resolveQemuBinary(profile: VmProfile): String? =
+        runCatching { runtimeSetup?.resolveQemuBinary(profile.architecture) }.getOrNull()
 
     fun start(vmId: String): Boolean {
         val profile = repository.get(vmId) ?: return false
@@ -257,11 +274,13 @@ class VmInstanceManager(
 
             val capabilities = capabilitiesProvider()
             val backend = resolveBackend(profile, capabilities)
+            val binaryPath = resolveQemuBinary(profile)
             val command = backend.buildLaunchCommand(
                 profile = profile,
                 capabilities = capabilities,
                 sharedDir = repository.sharedDir(vmId),
-                logDir = repository.logsDir(vmId)
+                logDir = repository.logsDir(vmId),
+                binaryPath = binaryPath
             )
             launchCommands[vmId] = command
             writeLaunchLog(vmId, command)
@@ -561,20 +580,32 @@ class VmInstanceManager(
     }
 
     /**
-     * Spawns the real QEMU process when the host exposes an executable binary.
-     * Any failure (I/O, exec denial, missing ELF loader) is logged as `[WARN]`
-     * and degrades to console mode: [start] must never crash or hang.
+     * Spawns the real QEMU process when the resolved binary is executable.
+     *
+     * Two sources are accepted: a bare `qemu-system-*` name from the host PATH
+     * (gated on [HostCapabilities.qemuBinaryPresent]) and an absolute path to a
+     * binary the user imported into `runtime/bin`, which needs no PATH entry at
+     * all. Any failure (I/O, exec denial, missing ELF loader) is logged as
+     * `[WARN]` and degrades to console mode: [start] must never crash or hang.
      */
     private fun launchQemuProcess(
         vmId: String,
         command: List<String>,
         capabilities: HostCapabilities
     ): Process? {
-        if (!capabilities.qemuBinaryPresent || command.isEmpty()) return null
+        if (command.isEmpty()) return null
         val binary = command.first()
-        if (!File(binary).canExecute()) {
+        val binaryFile = File(binary)
+        val importedBinary = binaryFile.isAbsolute
+        // A bare name can only be resolved through PATH, so it stays gated on the
+        // capability probe; an absolute path can be verified directly.
+        if (!importedBinary && !capabilities.qemuBinaryPresent) return null
+        if (!binaryFile.canExecute()) {
             appendConsole(vmId, "[WARN] $binary is not executable; falling back to console mode")
             return null
+        }
+        if (importedBinary) {
+            appendConsole(vmId, "[ OK ] imported QEMU runtime: $binary")
         }
         return try {
             val builder = ProcessBuilder(command).redirectErrorStream(true)

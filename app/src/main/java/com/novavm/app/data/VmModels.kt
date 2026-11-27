@@ -418,9 +418,21 @@ data class VmProfile(
     val qmpPort: Int = 4444,
     val adbForwardPort: Int = 15555,
     val createdAtEpochMs: Long = System.currentTimeMillis(),
-    val snapshots: List<VmSnapshot> = emptyList()
+    val snapshots: List<VmSnapshot> = emptyList(),
+    /**
+     * 用户自定义的宿主机 → 客户机端口转发规则。
+     *
+     * 默认空列表，所以旧版本写下的 `profile.json` 无需迁移即可继续解码；
+     * 只有「已启用且端口合法」的规则才会真正进入 QEMU 的
+     * `-netdev user,hostfwd=...` 参数（见 [activePortForwards]）。
+     */
+    val portForwards: List<PortForwardRule> = emptyList()
 ) {
     val displayName: String get() = name.ifBlank { id }
+
+    /** 真正会写进 QEMU 命令行的端口转发规则（已启用且端口合法）。 */
+    val activePortForwards: List<PortForwardRule>
+        get() = portForwards.filter { it.enabled && it.isValid() }
 
     /** Feature bundle handed to the VMOS extension injector on boot-script writes. */
     fun vmosBundle(): VmosFeatureBundle = VmosFeatureBundle(
