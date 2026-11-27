@@ -13,6 +13,7 @@ import com.novavm.app.data.VmSnapshot
 import com.novavm.app.data.VmStatus
 import com.novavm.app.location.GpsSyncResult
 import com.novavm.app.location.VirtualGpsEngine
+import com.novavm.app.root.RootXposedConfigurator
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,6 +22,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /** Immutable view of a VM's live state. */
 data class VmRuntimeState(
@@ -60,6 +62,10 @@ class VmInstanceManager(
     private val runtime = LinkedHashMap<String, VmRuntimeState>()
     private val logs = LinkedHashMap<String, ArrayDeque<String>>()
     private val launchCommands = LinkedHashMap<String, List<String>>()
+
+    /** Live qemu-system processes keyed by VM id. */
+    private val processes = LinkedHashMap<String, Process>()
+
 
     /** Last logged GPS fix per VM, so unchanged coordinates do not spam logs. */
     private val gpsFixes = LinkedHashMap<String, String>()
@@ -106,9 +112,11 @@ class VmInstanceManager(
             }
             runtime.clear()
             known.forEach { runtime[it.vmId] = it }
-            logs.keys.retainAll(profiles.map { it.id }.toSet())
-            launchCommands.keys.retainAll(profiles.map { it.id }.toSet())
-            gpsFixes.keys.retainAll(profiles.map { it.id }.toSet())
+            val liveIds = profiles.map { it.id }.toSet()
+            logs.keys.retainAll(liveIds)
+            launchCommands.keys.retainAll(liveIds)
+            gpsFixes.keys.retainAll(liveIds)
+            processes.keys.retainAll(liveIds)
             _states.value = known
             return known
         }
@@ -212,6 +220,7 @@ class VmInstanceManager(
     fun deleteProfile(vmId: String, deleteFiles: Boolean = true): Boolean {
         synchronized(lock) {
             if (runtime[vmId]?.isRunning == true) stop(vmId)
+            processes.remove(vmId)?.let { runCatching { it.destroy() } }
             val removed = repository.delete(vmId, deleteFiles)
             if (removed) {
                 runtime.remove(vmId)
@@ -253,6 +262,9 @@ class VmInstanceManager(
             )
             launchCommands[vmId] = command
             writeLaunchLog(vmId, command)
+            // Stage 2 must report real files on disk, so the guest bootstrap is
+            // regenerated for every launch before the hypervisor starts.
+            writeBootScripts(profile)
 
             update(vmId) {
                 it.copy(
@@ -263,35 +275,55 @@ class VmInstanceManager(
             }
             appendConsole(vmId, "Launching ${backend.backendName}: ${command.joinToString(" ")}")
 
-            val fallback = buildString {
+            val process = launchQemuProcess(vmId, command, capabilities)
+            val pid = process?.let { pidOf(it) } ?: -1
+
+            val effectiveBackend = buildString {
                 append(backend.backendName)
-                if (!capabilities.qemuBinaryPresent) append(" (console fallback)")
+                if (process == null) append(" (console fallback)")
             }
             update(vmId) {
                 it.copy(
                     status = VmStatus.RUNNING,
-                    backendName = fallback,
+                    backendName = effectiveBackend,
+                    pid = pid,
                     startedAtEpochMs = clock(),
                     errorMessage = null
                 )
             }
-            appendConsole(
-                vmId,
-                if (capabilities.qemuBinaryPresent) {
-                    "[ OK ] guest process requested on VNC ${profile.vncPort}"
-                } else {
+            when {
+                process != null -> appendConsole(
+                    vmId,
+                    "[ OK ] guest process running (pid=$pid) on VNC ${profile.vncPort}"
+                )
+
+                capabilities.qemuBinaryPresent -> appendConsole(
+                    vmId,
+                    "[WARN] qemu-system present but not launchable; boot console renderer active on VNC ${profile.vncPort}"
+                )
+
+                else -> appendConsole(
+                    vmId,
                     "[ .. ] no qemu-system binary in sandbox; boot console renderer active on VNC ${profile.vncPort}"
-                }
-            )
+                )
+            }
             syncVirtualLocation(vmId, reason = "start")
             return true
         }
     }
 
     fun stop(vmId: String): Boolean {
-        synchronized(lock) {
+        val process = synchronized(lock) {
             val current = state(vmId) ?: return false
             if (current.status == VmStatus.STOPPED) return false
+            processes.remove(vmId)
+        }
+        if (process != null) {
+            val pid = pidOf(process)
+            destroyQuietly(process)
+            appendConsole(vmId, "[ OK ] qemu process terminated (pid=$pid)")
+        }
+        synchronized(lock) {
             update(vmId) {
                 it.copy(status = VmStatus.STOPPED, pid = -1, startedAtEpochMs = null)
             }
@@ -415,4 +447,112 @@ class VmInstanceManager(
             )
         }
     }
+
+    /**
+     * Regenerates `shared/novavm_boot.sh` + `shared/init.novavm.rc` so the
+     * `STAGE 2 / STORAGE & SHARE` step always reports up-to-date guest scripts.
+     */
+    private fun writeBootScripts(profile: VmProfile) {
+        try {
+            repository.ensureVmDirectories(profile.id)
+            val files = RootXposedConfigurator(repository, profile.id).writeAll(
+                config = profile.rootXposed,
+                spoof = profile.deviceSpoof,
+                hardware = profile.hardware,
+                profileName = profile.displayName,
+                virtualLocation = profile.virtualLocation
+            )
+            appendConsole(
+                profile.id,
+                "[ OK ] boot scripts staged: ${files.joinToString(", ") { it.name }}"
+            )
+        } catch (error: Throwable) {
+            appendConsole(
+                profile.id,
+                "[WARN] boot script generation failed: ${error.message ?: error.javaClass.simpleName}"
+            )
+        }
+    }
+
+    /**
+     * Spawns the real QEMU process when the host exposes an executable binary.
+     * Any failure (I/O, exec denial, missing ELF loader) is logged as `[WARN]`
+     * and degrades to console mode: [start] must never crash or hang.
+     */
+    private fun launchQemuProcess(
+        vmId: String,
+        command: List<String>,
+        capabilities: HostCapabilities
+    ): Process? {
+        if (!capabilities.qemuBinaryPresent || command.isEmpty()) return null
+        val binary = command.first()
+        if (!File(binary).canExecute()) {
+            appendConsole(vmId, "[WARN] $binary is not executable; falling back to console mode")
+            return null
+        }
+        return try {
+            val builder = ProcessBuilder(command).redirectErrorStream(true)
+            val workingDir = repository.vmDir(vmId)
+            if (workingDir.isDirectory) builder.directory(workingDir)
+            val process = builder.start()
+            processes[vmId] = process
+            startOutputPump(vmId, process)
+            process
+        } catch (error: Throwable) {
+            appendConsole(
+                vmId,
+                "[WARN] qemu spawn failed: ${error.message ?: error.javaClass.simpleName}; " +
+                    "falling back to console mode"
+            )
+            null
+        }
+    }
+
+    /** Pumps merged stdout/stderr of [process] into the VM console log. */
+    private fun startOutputPump(vmId: String, process: Process) {
+        Thread({
+            try {
+                process.inputStream.bufferedReader().use { reader ->
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) appendConsole(vmId, line)
+                        line = reader.readLine()
+                    }
+                }
+            } catch (error: Throwable) {
+                appendConsole(
+                    vmId,
+                    "[WARN] qemu output pump stopped: ${error.message ?: error.javaClass.simpleName}"
+                )
+            }
+            synchronized(lock) { if (processes[vmId] === process) processes.remove(vmId) }
+            val exit = runCatching { process.exitValue() }.getOrDefault(-1)
+            appendConsole(vmId, "[ .. ] qemu process exited (code=$exit)")
+        }, "NovaVM-Qemu-$vmId").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** `destroy()`, escalating to `destroyForcibly()` when it does not exit. */
+    private fun destroyQuietly(process: Process) {
+        runCatching { process.destroy() }
+        runCatching {
+            if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
+        }
+    }
+
+    /**
+     * Guest process id, or -1 when the runtime cannot report one.
+     *
+     * Resolved reflectively because `java.lang.Process.pid()` is a Java 9 API
+     * that is not part of every Android platform stub, and spawning must never
+     * fail just because a PID is unavailable.
+     */
+    private fun pidOf(process: Process): Int = runCatching {
+        val value = process.javaClass.methods
+            .firstOrNull { it.name == "pid" && it.parameterCount == 0 }
+            ?.invoke(process)
+        (value as? Number)?.toInt() ?: -1
+    }.getOrDefault(-1)
 }

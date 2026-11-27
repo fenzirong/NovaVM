@@ -171,7 +171,8 @@ class VmDisplayActivity : ComponentActivity() {
             targetFps = loaded.hardware.targetFps.coerceIn(24, 60),
             onLog = { line ->
                 application.vmInstanceManager.appendConsole(loaded.id, line)
-            }
+            },
+            capabilitiesProvider = { application.hostCapabilities }
         )
         display.console.appendLine("[ OK ] display attached: ${loaded.hardware.width}x${loaded.hardware.height} @ ${loaded.hardware.targetFps}fps")
         display.console.appendLine("[ .. ] RFB ${VmDisplayPipeline.HOST}:${loaded.vncPort} / ${loaded.architecture.name} ${loaded.backendType.name}")

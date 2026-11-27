@@ -4,6 +4,27 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
+ * Structured, ordered boot stages painted by [BootConsoleRenderer].
+ *
+ * Labels stay pure ASCII because the 5x7 bitmap font has no CJK glyphs. Each
+ * stage carries the progress value the renderer should show when it becomes
+ * active, so the boot sequence has a single source of truth instead of a
+ * hardcoded `0.24f`.
+ */
+enum class BootStage(val label: String, val defaultProgress: Float) {
+    STAGE_1_HOST_PROBE("STAGE 1 / HOST PROBE", 0.18f),
+    STAGE_2_STORAGE_SHARE("STAGE 2 / STORAGE & SHARE", 0.42f),
+    STAGE_3_HYPERVISOR("STAGE 3 / HYPERVISOR INIT", 0.68f),
+    STAGE_4_DISPLAY_BRIDGE("STAGE 4 / DISPLAY BRIDGE", 0.88f),
+    STAGE_5_READY("STAGE 5 / SYSTEM READY", 1.0f),
+    STAGE_5_RFB_LIVE("STAGE 5 / RFB LIVE", 1.0f);
+
+    /** True once the boot sequence finished (ready console or live RFB). */
+    val isTerminal: Boolean
+        get() = this == STAGE_5_READY || this == STAGE_5_RFB_LIVE
+}
+
+/**
  * Software fallback display surface.
  *
  * When the app has no QEMU binary, no ROM or no RFB server yet, the console
@@ -21,9 +42,15 @@ class BootConsoleRenderer(
 
     var status: String = "CONSOLE READY"
     var statusDetail: String = "No guest kernel attached"
-    var progress: Float = 0.18f
+    var progress: Float = BootStage.STAGE_1_HOST_PROBE.defaultProgress
     var footerHint: String = "Tap to interact  |  VNC 127.0.0.1:5901"
-    var bootStage: String = "STAGE 1 / HOST PROBE"
+
+    /** Raw label painted in the progress panel; kept writable for compatibility. */
+    var bootStage: String = BootStage.STAGE_1_HOST_PROBE.label
+
+    /** Structured counterpart of [bootStage], advanced by [setBootStage]. */
+    var currentBootStage: BootStage = BootStage.STAGE_1_HOST_PROBE
+        private set
 
     private val accent = 0xFF4ADE80.toInt()
     private val accentDim = 0xFF1F6F43.toInt()
@@ -60,6 +87,31 @@ class BootConsoleRenderer(
     fun setStatus(value: String, detail: String = statusDetail): BootConsoleRenderer {
         status = value
         statusDetail = detail
+        return this
+    }
+
+    /**
+     * Advances the boot stage label and its progress value in one step.
+     *
+     * @param detail optional new status detail shown under the header.
+     * @param progressOverride explicit progress (0..1); defaults to
+     *   [BootStage.defaultProgress].
+     */
+    fun setBootStage(
+        stage: BootStage,
+        detail: String? = null,
+        progressOverride: Float? = null
+    ): BootConsoleRenderer {
+        currentBootStage = stage
+        bootStage = stage.label
+        progress = (progressOverride ?: stage.defaultProgress).coerceIn(0f, 1f)
+        if (detail != null) statusDetail = detail
+        return this
+    }
+
+    /** Replaces the bottom footer hint (e.g. to show the VM's real VNC port). */
+    fun setFooterHint(hint: String): BootConsoleRenderer {
+        footerHint = hint
         return this
     }
 

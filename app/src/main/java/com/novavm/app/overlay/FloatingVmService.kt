@@ -28,6 +28,7 @@ import androidx.core.content.ContextCompat
 import com.novavm.app.NovaVmApp
 import com.novavm.app.R
 import com.novavm.app.data.VmProfile
+import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.RfbProtocol
 import kotlin.math.hypot
 
@@ -110,7 +111,8 @@ class FloatingVmService : Service() {
             height = dims.second,
             vncPort = profile.vncPort,
             targetFps = profile.hardware.targetFps.coerceIn(24, 60),
-            onLog = { line -> app?.vmInstanceManager?.appendConsole(profile.id, line) }
+            onLog = { line -> app?.vmInstanceManager?.appendConsole(profile.id, line) },
+            capabilitiesProvider = { app?.hostCapabilities ?: HostCapabilities.conservative() }
         )
         display.console.setStatus("FLOATING WINDOW", "tap header to drag · mini nav below")
         display.console.setProgress(0.46f)
