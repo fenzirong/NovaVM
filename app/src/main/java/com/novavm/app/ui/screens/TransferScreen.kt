@@ -91,8 +91,14 @@ fun TransferScreen(
     var includeSystemApps by remember { mutableStateOf(false) }
     val hostApps by vm.hostApps.collectAsState()
 
-    LaunchedEffect(includeSystemApps) {
-        vm.refreshHostApps(includeSystemApps)
+    /**
+     * Host apps are only rendered on the 「导入本机应用」 segment, so the scan is
+     * driven by the segment too: entering the tab (or flipping the system-app
+     * filter) always issues a fresh load, and a failed/empty first scan can no
+     * longer leave the tab permanently blank.
+     */
+    LaunchedEffect(segment, includeSystemApps) {
+        if (segment == 1) vm.refreshHostApps(includeSystemApps)
     }
 
     // Computed in the composable body: LazyListScope itself is not composable.
@@ -368,10 +374,23 @@ fun TransferScreen(
             }
 
             item {
-                val hostClipboard = clipboard.getText()?.text.orEmpty()
+                // `getText()` is not observable, so the value read during
+                // composition goes stale as soon as the user copies something.
+                // The snapshot is only used for the label; the click re-reads
+                // the live clipboard and lets the ViewModel reject empty text
+                // with a Chinese toast instead of writing a blank file.
+                // Clipboard access can throw on locked-down OEM builds, so even
+                // the label read is guarded.
+                val hostClipboard = runCatching { clipboard.getText()?.text }
+                    .getOrNull()
+                    .orEmpty()
                 Button(
-                    onClick = { vm.syncHostClipboardToVm(profile.id, hostClipboard) },
-                    enabled = hostClipboard.isNotBlank(),
+                    onClick = {
+                        val latest = runCatching { clipboard.getText()?.text }
+                            .getOrNull()
+                            .orEmpty()
+                        vm.syncHostClipboardToVm(profile.id, latest)
+                    },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = NovaPalette.Emerald.copy(alpha = 0.9f),
                         contentColor = Color(0xFF04140E)

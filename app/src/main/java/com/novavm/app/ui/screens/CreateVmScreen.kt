@@ -434,7 +434,9 @@ fun CreateVmScreen(
                         onCreated = onCreated
                     )
                 },
-                enabled = name.isNotBlank(),
+                // `state.loading` closes the double-tap window: createVm() is
+                // asynchronous, so two fast taps used to persist two identical VMs.
+                enabled = name.isNotBlank() && !state.loading,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = NovaPalette.Cyan,
                     contentColor = Color(0xFF04121C)

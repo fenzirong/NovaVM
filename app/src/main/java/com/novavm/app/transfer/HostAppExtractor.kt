@@ -72,12 +72,17 @@ object HostAppExtractor {
         // Launchable apps first: they answer "what can I install?" and stay
         // visible under Android 11+ visibility rules.
         launchablePackages(packageManager).forEach { packageName ->
-            describe(packageManager, packageName)?.let { byPackage.putIfAbsent(packageName, it) }
+            // `putIfAbsent(packageName, describe(...))` evaluates describe()
+            // even when the entry already exists, doubling the binder calls
+            // for every launchable app on a cold list load.
+            if (byPackage.containsKey(packageName)) return@forEach
+            describe(packageManager, packageName)?.let { byPackage[packageName] = it }
         }
         // Then anything else the platform is willing to report (non-launcher
         // apps, plus system packages when asked for). Duplicates are ignored.
         installedPackages(packageManager).forEach { packageName ->
-            describe(packageManager, packageName)?.let { byPackage.putIfAbsent(packageName, it) }
+            if (byPackage.containsKey(packageName)) return@forEach
+            describe(packageManager, packageName)?.let { byPackage[packageName] = it }
         }
 
         return byPackage.values

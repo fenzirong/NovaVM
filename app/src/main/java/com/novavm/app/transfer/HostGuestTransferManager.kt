@@ -6,6 +6,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
+import java.util.UUID
 
 /** Entry of a VM's shared folder as shown in the transfer UI. */
 data class SharedFileInfo(
@@ -37,6 +38,9 @@ class HostGuestTransferManager(private val vmDir: File) {
         const val MOUNT_TAG = "novavm_share"
         private const val COPY_BUFFER = 32 * 1024
 
+        /** Prefix of the staging file used while an import is in flight. */
+        private const val PARTIAL_PREFIX = ".novavm-part-"
+
         fun adbSerial(adbPort: Int): String = "127.0.0.1:$adbPort"
     }
 
@@ -55,6 +59,9 @@ class HostGuestTransferManager(private val vmDir: File) {
         val directory = resolveDirectory(relativeDirectory) ?: return emptyList()
         val base = sharedDir.canonicalFile
         return directory.listFiles()
+            // A crashed import can leave its staging file behind; it is not part
+            // of the share and must never show up in the UI.
+            ?.filterNot { it.name.startsWith(PARTIAL_PREFIX) }
             ?.map { file ->
                 SharedFileInfo(
                     name = file.name,
@@ -91,13 +98,35 @@ class HostGuestTransferManager(private val vmDir: File) {
         require(safeName.isNotBlank()) { "fileName must not be blank" }
 
         val baseTarget = File(targetDir, safeName)
+        // A sanitized name can still be a path inside the folder (never outside
+        // it), but a name that resolves elsewhere means the sanitizer failed.
+        if (baseTarget.canonicalFile.parentFile?.canonicalPath != targetDir.canonicalPath) {
+            throw IOException("Invalid file name: $fileName")
+        }
         val target = if (overwrite) baseTarget else uniqueTarget(baseTarget)
         if (target.exists() && target.isDirectory) {
             throw IOException("${target.name} is a directory")
         }
 
-        input.use { source ->
-            target.outputStream().use { sink -> source.copyTo(sink, COPY_BUFFER) }
+        // Stage into a hidden temp file first: an interrupted copy (cancelled
+        // upload, unplugged cable) must not leave a truncated file in the share
+        // that the guest then tries to install.
+        val staged = File(targetDir, PARTIAL_PREFIX + UUID.randomUUID())
+        try {
+            input.use { source ->
+                staged.outputStream().use { sink -> source.copyTo(sink, COPY_BUFFER) }
+            }
+            if (!staged.renameTo(target)) {
+                // Some 9p/ext4 setups refuse a rename onto an existing file.
+                staged.inputStream().use { source ->
+                    target.outputStream().use { sink -> source.copyTo(sink, COPY_BUFFER) }
+                }
+            }
+        } catch (error: Throwable) {
+            staged.delete()
+            throw error
+        } finally {
+            if (staged.exists()) staged.delete()
         }
         return target
     }
@@ -120,7 +149,10 @@ class HostGuestTransferManager(private val vmDir: File) {
     }
 
     fun deleteFile(relativePath: String): Boolean {
-        val file = resolveFile(relativePath) ?: return false
+        // `resolveFile` only ever returns regular files, which made the
+        // directory branch below dead code: deleting a folder from the share
+        // silently reported "not found".
+        val file = resolveEntry(relativePath) ?: return false
         return if (file.isDirectory) file.deleteRecursively() else file.delete()
     }
 
@@ -236,13 +268,23 @@ class HostGuestTransferManager(private val vmDir: File) {
 
     /** Resolves a path inside the share, rejecting traversal and absolutes. */
     fun resolveFile(relativePath: String): File? {
+        val candidate = resolveEntry(relativePath) ?: return null
+        return candidate.takeIf { it.exists() && it.isFile }
+    }
+
+    /**
+     * Resolves a path inside the share without requiring it to exist or to be a
+     * file. The share root itself is never returned, so callers cannot
+     * accidentally operate on the whole `shared/` directory.
+     */
+    private fun resolveEntry(relativePath: String): File? {
         val canonicalBase = sharedDir.canonicalFile
         val candidate = File(canonicalBase, relativePath).canonicalFile
-        return if (candidate.path == canonicalBase.path || candidate.path.startsWith(canonicalBase.path + File.separator)) {
-            candidate.takeIf { it.exists() && it.isFile }
-        } else {
-            null
-        }
+        val allowed = candidate.path == canonicalBase.path ||
+            candidate.path.startsWith(canonicalBase.path + File.separator)
+        if (!allowed) return null
+        if (candidate.path == canonicalBase.path) return null
+        return candidate
     }
 
     fun resolveDirectory(relativeDirectory: String): File? {
@@ -255,15 +297,23 @@ class HostGuestTransferManager(private val vmDir: File) {
         return candidate.takeIf { it.isDirectory }
     }
 
+    /**
+     * Reduces an arbitrary upload name to a safe leaf file name.
+     *
+     * Directories are stripped, everything outside `[A-Za-z0-9-_. ]` becomes
+     * `_`, and leading/trailing dots are dropped so `.`, `..` and other
+     * "dot only" names can never resolve to a parent directory.
+     */
     fun sanitizeFileName(raw: String): String {
         val base = raw.substringAfterLast('/').substringAfterLast('\\')
-        return base.map { ch ->
+        val mapped = base.map { ch ->
             when {
                 ch.isLetterOrDigit() -> ch
                 ch in "-_. " -> ch
                 else -> '_'
             }
-        }.joinToString("").trim().take(120)
+        }.joinToString("").trim().trim('.', ' ')
+        return mapped.take(120)
     }
 
     private fun uniqueTarget(base: File): File {
@@ -281,8 +331,55 @@ class HostGuestTransferManager(private val vmDir: File) {
         return candidate
     }
 
-    private fun escapeShell(value: String): String = value.replace("\"", "\\\"")
+    /**
+     * Escapes one value for a POSIX double-quoted string in the generated
+     * installer script. Only `\`, `"`, `$` and `` ` `` carry meaning inside
+     * `"…"`; escaping just `"` let `$(…)`, backticks and `\` run as root in the
+     * guest.
+     */
+    private fun escapeShell(value: String): String = buildString(value.length + 8) {
+        value.forEach { ch ->
+            when {
+                ch == '\\' -> append("\\\\")
+                ch == '"' -> append("\\\"")
+                ch == '$' -> append("\\\$")
+                ch == '`' -> append("\\`")
+                ch == '\n' || ch == '\r' || ch == '\t' -> append(' ')
+                ch < ' ' || ch == '\u007F' -> Unit
+                else -> append(ch)
+            }
+        }
+    }
 
-    private fun quote(value: String): String =
-        if (value.any { it.isWhitespace() }) "\"$value\"" else value
+    /**
+     * Quotes a host path for a shell command line.
+     *
+     * The value is always wrapped in `"…"` and the characters that stay special
+     * inside double quotes are escaped; a backslash is only doubled when it
+     * would otherwise escape the character after it, so Windows paths keep
+     * working while `"; rm -rf /"`-style values cannot break out.
+     */
+    private fun quote(value: String): String = buildString(value.length + 2) {
+        append('"')
+        value.forEachIndexed { index, ch ->
+            when (ch) {
+                '\\' -> {
+                    val next = value.getOrNull(index + 1)
+                    if (next == null || next == '"' || next == '$' || next == '`' || next == '\\' ||
+                        next == '\n'
+                    ) {
+                        append("\\\\")
+                    } else {
+                        append('\\')
+                    }
+                }
+                '"' -> append("\\\"")
+                '$' -> append("\\\$")
+                '`' -> append("\\`")
+                '\n', '\r' -> append(' ')
+                else -> append(ch)
+            }
+        }
+        append('"')
+    }
 }

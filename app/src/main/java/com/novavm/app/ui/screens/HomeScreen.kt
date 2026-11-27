@@ -98,9 +98,16 @@ fun HomeScreen(
         if (uri != null) vm.importVmBackup(uri)
     }
 
-    /** Runs [action] directly, or behind the privacy PIN when the VM is locked. */
+    /**
+     * Runs [action] directly, or behind the privacy PIN when the VM is locked.
+     *
+     * A lock that carries no usable hash would reject every PIN, so an empty
+     * `pinHash` is treated as "not locked" instead of trapping the user in a
+     * dialog that can never verify.
+     */
     fun gated(profile: VmProfile, action: () -> Unit) {
-        if (profile.privacyLock.enabled) {
+        val lock = profile.privacyLock
+        if (lock.enabled && lock.pinHash.isNotBlank()) {
             pinPrompt = PinPrompt(profile.id, profile.displayName, action)
         } else {
             action()
@@ -181,8 +188,8 @@ fun HomeScreen(
                         onOpenDisplay = { gated(profile) { onOpenDisplay(profile.id) } },
                         onFloating = { gated(profile) { onOpenFloating(profile.id) } },
                         onSettings = { gated(profile) { onOpenSettings(profile.id) } },
-                        onClone = { vm.cloneVm(profile.id) },
-                        onDelete = { vm.deleteVm(profile.id) }
+                        onClone = { gated(profile) { vm.cloneVm(profile.id) } },
+                        onDelete = { gated(profile) { vm.deleteVm(profile.id) } }
                     )
                 }
             }
@@ -191,6 +198,7 @@ fun HomeScreen(
 
     pinPrompt?.let { prompt ->
         PrivacyPinDialog(
+            vmId = prompt.vmId,
             vmName = prompt.vmName,
             onDismiss = { pinPrompt = null },
             onVerified = { pin ->
@@ -244,12 +252,15 @@ private fun KeepAliveBanner(onStop: () -> Unit) {
 
 @Composable
 private fun PrivacyPinDialog(
+    vmId: String,
     vmName: String,
     onDismiss: () -> Unit,
     onVerified: (String) -> Boolean
 ) {
-    var pin by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
+    // Keyed on the prompt's VM: a second gated action must never inherit the
+    // half-typed PIN / stale error of the previous one.
+    var pin by remember(vmId) { mutableStateOf("") }
+    var error by remember(vmId) { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -281,9 +292,11 @@ private fun PrivacyPinDialog(
         },
         confirmButton = {
             TextButton(onClick = {
+                val candidate = pin.trim()
                 when {
-                    pin.length < 4 -> error = "请输入 4-6 位数字密码"
-                    onVerified(pin) -> Unit
+                    candidate.length < NovaVmViewModel.PRIVACY_PIN_MIN_LENGTH ->
+                        error = "请输入 4-6 位数字密码"
+                    onVerified(candidate) -> Unit
                     else -> {
                         error = "密码错误，请重试"
                         pin = ""

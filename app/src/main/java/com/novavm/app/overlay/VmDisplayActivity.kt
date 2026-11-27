@@ -86,7 +86,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.novavm.app.MainActivity
 import com.novavm.app.NovaVmApp
 import com.novavm.app.data.VmProfile
@@ -98,7 +100,6 @@ import com.novavm.app.ui.theme.NovaPalette
 import com.novavm.app.ui.theme.NovaVmTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -146,14 +147,27 @@ class VmDisplayActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemBars()
 
-        val vmId = intent.getStringExtra(EXTRA_VM_ID)
-            ?: application.vmRepository.loadAll().firstOrNull()?.id
-        val loaded = vmId?.let { application.vmRepository.get(it) }
-        if (loaded == null) {
-            Toast.makeText(this, "找不到虚拟机", Toast.LENGTH_SHORT).show()
-            finish()
-            return
+        // The profile lookup hits the on-disk store (`vmRepository.loadAll/get`):
+        // running it inline blocked onCreate long enough for an ANR on cold start.
+        val requestedId = intent.getStringExtra(EXTRA_VM_ID)
+        lifecycleScope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                val vmId = requestedId ?: application.vmRepository.loadAll().firstOrNull()?.id
+                vmId?.let { application.vmRepository.get(it) }
+            }
+            if (isFinishing || isDestroyed) return@launch
+            if (loaded == null) {
+                Toast.makeText(this@VmDisplayActivity, "找不到虚拟机", Toast.LENGTH_SHORT).show()
+                finish()
+                return@launch
+            }
+            bindProfile(loaded)
         }
+    }
+
+    /** Applies the loaded profile: display pipeline, HUD state, observers, content. */
+    private fun bindProfile(loaded: VmProfile) {
+        val application = application as NovaVmApp
         profile = loaded
         application.setActiveVm(loaded.id)
         gpsLatitude = loaded.virtualLocation.latitude
@@ -197,45 +211,54 @@ class VmDisplayActivity : ComponentActivity() {
         pipeline = display
         display.start()
 
-        setPictureInPictureParams(pipParams(loaded))
+        // A zero/odd guest aspect ratio makes PictureInPictureParams.Builder.build()
+        // throw IllegalArgumentException, which would take the screen down with it.
+        runCatching { setPictureInPictureParams(pipParams(loaded)) }
 
         lifecycleScope.launch {
-            while (isActive) {
-                val current = pipeline
-                if (current != null) {
-                    measuredFps = current.measuredFps
-                    sourceLabel = if (current.source == VmDisplayPipeline.Source.RFB) "客户机 RFB" else "启动控制台"
-                    backendLabel = application.vmInstanceManager.state(loaded.id)?.backendName
-                        ?: loaded.backendType.name
-                    paused = application.vmInstanceManager.state(loaded.id)?.status ==
-                        com.novavm.app.data.VmStatus.PAUSED
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    val current = pipeline
+                    if (current != null) {
+                        measuredFps = current.measuredFps
+                        sourceLabel = if (current.source == VmDisplayPipeline.Source.RFB) "客户机 RFB" else "启动控制台"
+                        backendLabel = application.vmInstanceManager.state(loaded.id)?.backendName
+                            ?: loaded.backendType.name
+                        paused = application.vmInstanceManager.state(loaded.id)?.status ==
+                            com.novavm.app.data.VmStatus.PAUSED
+                    }
+                    delay(700)
                 }
-                delay(700)
             }
         }
 
         lifecycleScope.launch {
-            application.routeSimulator.playbackStates.collect { states ->
-                val playback = states[loaded.id]
-                routePlaying = playback?.isPlaying == true
-                routeProgress = playback?.takeIf { it.hasRoute }
-                    ?.let { RouteSimulator.progressText(it) }
-                    .orEmpty()
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                application.routeSimulator.playbackStates.collect { states ->
+                    val playback = states[loaded.id]
+                    routePlaying = playback?.isPlaying == true
+                    routeProgress = playback?.takeIf { it.hasRoute }
+                        ?.let { RouteSimulator.progressText(it) }
+                        .orEmpty()
+                }
             }
         }
 
-        lifecycleScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                val fresh = runCatching { application.vmRepository.get(loaded.id) }.getOrNull()
-                val available = (fresh?.virtualLocation?.routeWaypoints?.size ?: 0) >= 2
-                withContext(Dispatchers.Main) {
-                    routeAvailable = available
+        lifecycleScope.launch {
+            // Polls the on-disk store; it must not keep hammering disk while the
+            // display is stopped (background / PiP), hence the RESUMED gate.
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    val fresh = withContext(Dispatchers.IO) {
+                        runCatching { application.vmRepository.get(loaded.id) }.getOrNull()
+                    }
+                    routeAvailable = (fresh?.virtualLocation?.routeWaypoints?.size ?: 0) >= 2
                     if (fresh != null) {
                         gpsLatitude = fresh.virtualLocation.latitude
                         gpsLongitude = fresh.virtualLocation.longitude
                     }
+                    delay(2_000)
                 }
-                delay(2_000)
             }
         }
 
@@ -366,35 +389,47 @@ class VmDisplayActivity : ComponentActivity() {
 
     /**
      * 「截屏」：把当前帧缓冲（客户机 RFB 或启动控制台）编码成 PNG 存进相册。
+     *
+     * 帧拷贝 + PNG 编码 + MediaStore 写入都是重活（1080p 帧 8 MiB），全部在
+     * 主线程做会直接卡住 UI 乃至 ANR，所以整体搬到后台，只有 Toast / 控制台
+     * 回显回到主线程。
      */
     private fun captureScreenshot() {
         val display = pipeline ?: return
-        val frame = display.captureCurrentFrameRgba()
-        if (frame == null) {
-            Toast.makeText(this, "当前没有可截取的画面", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val (bytes, frameWidth, frameHeight) = frame
         val vmName = profile?.displayName ?: "NovaVM"
-        VmScreenshotHelper.captureToGalleryOrAppDir(
-            context = this,
-            vmName = vmName,
-            rgbaBytes = bytes,
-            width = frameWidth,
-            height = frameHeight
-        ).fold(
-            onSuccess = { saved ->
-                Toast.makeText(this, "截图已保存：$saved", Toast.LENGTH_LONG).show()
-                display.appendConsole("[ OK ] screenshot saved ($frameWidth x $frameHeight)")
-            },
-            onFailure = { error ->
-                Toast.makeText(
-                    this,
-                    "截图失败：${error.message ?: error.javaClass.simpleName}",
-                    Toast.LENGTH_LONG
-                ).show()
+        lifecycleScope.launch {
+            val frame = withContext(Dispatchers.Default) {
+                runCatching { display.captureCurrentFrameRgba() }.getOrNull()
             }
-        )
+            if (frame == null) {
+                Toast.makeText(this@VmDisplayActivity, "当前没有可截取的画面", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val (bytes, frameWidth, frameHeight) = frame
+            val result = withContext(Dispatchers.IO) {
+                VmScreenshotHelper.captureToGalleryOrAppDir(
+                    context = this@VmDisplayActivity,
+                    vmName = vmName,
+                    rgbaBytes = bytes,
+                    width = frameWidth,
+                    height = frameHeight
+                )
+            }
+            if (isFinishing || isDestroyed) return@launch
+            result.fold(
+                onSuccess = { saved ->
+                    Toast.makeText(this@VmDisplayActivity, "截图已保存：$saved", Toast.LENGTH_LONG).show()
+                    display.appendConsole("[ OK ] screenshot saved ($frameWidth x $frameHeight)")
+                },
+                onFailure = { error ->
+                    Toast.makeText(
+                        this@VmDisplayActivity,
+                        "截图失败：${error.message ?: error.javaClass.simpleName}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            )
+        }
     }
 
     /** 「旋转」：在横屏与竖屏之间切换 HUD 方向。 */
@@ -406,6 +441,21 @@ class VmDisplayActivity : ComponentActivity() {
         }
         requestedOrientation = next
         landscapeLocked = next == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        // Persist the choice: otherwise the next recreation re-applies
+        // profile.keepAlive.landscapeLocked and silently undoes this toggle.
+        val loaded = profile
+        val application = app
+        if (loaded != null && application != null &&
+            loaded.keepAlive.landscapeLocked != landscapeLocked
+        ) {
+            val updated = loaded.copy(
+                keepAlive = loaded.keepAlive.copy(landscapeLocked = landscapeLocked)
+            )
+            profile = updated
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { application.vmRepository.update(updated) }
+            }
+        }
         Toast.makeText(
             this,
             if (landscapeLocked) "已切换为横屏" else "已切换为竖屏",

@@ -80,6 +80,19 @@ class VmBackupManager(
         /** Per-entry ceiling: skipped on export, rejected on import (512 MiB). */
         const val MAX_ENTRY_BYTES: Long = 512L * 1024L * 1024L
 
+        /**
+         * Whole-archive ceiling on import. [MAX_ENTRY_BYTES] alone is not a zip
+         * bomb defence: thousands of entries just under the per-entry limit
+         * still fill the disk.
+         */
+        const val MAX_TOTAL_BYTES: Long = 4L * 1024L * 1024L * 1024L
+
+        /** `profile.json` is a small document; anything bigger is a bomb. */
+        const val MAX_PROFILE_BYTES: Long = 8L * 1024L * 1024L
+
+        /** Longest accepted archive entry name (filesystem path ceilings). */
+        private const val MAX_ENTRY_NAME_LENGTH = 1024
+
         private const val COPY_BUFFER = 32 * 1024
         private const val STAGING_PREFIX = ".novavm-import-"
         private const val IMPORTED_NAME_FALLBACK = "Imported VM"
@@ -116,10 +129,15 @@ class VmBackupManager(
                     val relative = file.relativeTo(root).invariantSeparatorsPath
                     val entryName = normalizeEntryName("$directoryName/$relative")
                     zip.putNextEntry(timedEntry(entryName, file.lastModified()))
-                    file.inputStream().use { input -> input.copyTo(zip, COPY_BUFFER) }
+                    // Trust `length()` only for the summary: a file that grows
+                    // between the walk and the copy is cut at the entry ceiling
+                    // so an export can always be imported back.
+                    val written = file.inputStream().use { input ->
+                        copyEntryBounded(input, zip)
+                    }
                     zip.closeEntry()
                     fileCount++
-                    totalBytes += file.length()
+                    totalBytes += written
                 }
             }
         } finally {
@@ -148,7 +166,8 @@ class VmBackupManager(
      * @param nameOverride optional new display name; blank values are ignored.
      * @throws SecurityException when an entry attempts a Zip-Slip escape.
      * @throws IllegalArgumentException when the archive carries no readable
-     *   `profile.json` or an entry exceeds [MAX_ENTRY_BYTES].
+     *   `profile.json`, or when an entry exceeds [MAX_ENTRY_BYTES] / the whole
+     *   archive exceeds [MAX_TOTAL_BYTES].
      */
     fun importVmFromZip(
         inputStream: InputStream,
@@ -185,7 +204,16 @@ class VmBackupManager(
                 snapshots = emptyList()
             )
 
-            val created = repository.create(requested)
+            // `create` allocates the directory tree before it persists the
+            // profile; when the persist step fails the tree is orphaned on disk.
+            // The id is ours, so it can be removed again.
+            val created = try {
+                repository.create(requested)
+            } catch (error: Throwable) {
+                runCatching { repository.delete(newId) }
+                runCatching { repository.vmDir(newId).deleteRecursively() }
+                throw error
+            }
             try {
                 for (directoryName in ARCHIVED_DIRECTORIES) {
                     relocateChildren(
@@ -194,8 +222,10 @@ class VmBackupManager(
                     )
                 }
             } catch (error: Throwable) {
-                // Never leave a half-populated VM behind.
+                // Never leave a half-populated VM behind: drop it from the
+                // repository *and* from disk before rethrowing.
                 runCatching { repository.delete(created.id) }
+                runCatching { repository.vmDir(created.id).deleteRecursively() }
                 throw error
             }
             return created
@@ -217,6 +247,15 @@ class VmBackupManager(
         if (cleaned.isEmpty()) {
             throw IllegalArgumentException("Zip entry has an empty name")
         }
+        // A NUL (or any other control character) would be truncated by the
+        // filesystem *after* the traversal checks below ran, so it has to be
+        // refused up front rather than silently rewritten.
+        if (cleaned.any { it < ' ' || it == '\u007F' }) {
+            throw SecurityException("Zip entry with control characters rejected")
+        }
+        if (cleaned.length > MAX_ENTRY_NAME_LENGTH) {
+            throw IllegalArgumentException("Zip entry name is too long")
+        }
         if (cleaned.startsWith("/")) {
             throw SecurityException("Absolute zip entry rejected: $raw")
         }
@@ -237,17 +276,23 @@ class VmBackupManager(
 
     /**
      * Recursive file walk that keeps a canonical-path guard so a symlink loop
-     * cannot hang the export. Ordering is name-sorted for reproducible archives.
+     * cannot hang the export, and so a symlink pointing outside [root] cannot
+     * pull unrelated host files into the archive.
+     *
+     * Ordering is name-sorted for reproducible archives.
      */
     private fun archivedFiles(root: File): List<File> {
         val collected = mutableListOf<File>()
         val visited = HashSet<String>()
+        val canonicalRoot = runCatching { root.canonicalPath }.getOrNull()
 
         fun walk(directory: File) {
             val canonical = runCatching { directory.canonicalPath }.getOrNull() ?: return
             if (!visited.add(canonical)) return
             val children = directory.listFiles() ?: return
             children.sortedBy { it.name.lowercase() }.forEach { child ->
+                val canonicalChild = runCatching { child.canonicalPath }.getOrNull() ?: return@forEach
+                if (canonicalRoot != null && !isInsideRoot(canonicalChild, canonicalRoot)) return@forEach
                 when {
                     child.isDirectory -> walk(child)
                     child.isFile -> collected += child
@@ -258,6 +303,9 @@ class VmBackupManager(
         walk(root)
         return collected
     }
+
+    private fun isInsideRoot(candidatePath: String, canonicalRoot: String): Boolean =
+        candidatePath == canonicalRoot || candidatePath.startsWith(canonicalRoot + File.separator)
 
     /** True when [file] is small, non-disk-media user data worth archiving. */
     private fun shouldArchive(file: File, profile: VmProfile): Boolean {
@@ -277,27 +325,72 @@ class VmBackupManager(
     private fun timedEntry(name: String, lastModified: Long): ZipEntry =
         ZipEntry(name).apply { time = if (lastModified > 0L) lastModified else clock() }
 
+    /** Copies at most [MAX_ENTRY_BYTES] of [input] into [sink]; returns the count. */
+    private fun copyEntryBounded(input: InputStream, sink: OutputStream): Long {
+        val buffer = ByteArray(COPY_BUFFER)
+        var written = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (written + read > MAX_ENTRY_BYTES) {
+                val room = (MAX_ENTRY_BYTES - written).toInt()
+                if (room > 0) {
+                    sink.write(buffer, 0, room)
+                    written += room
+                }
+                break
+            }
+            sink.write(buffer, 0, read)
+            written += read
+        }
+        return written
+    }
+
     // ------------------------------------------------------ internals: import
 
     /**
      * Spools an untrusted archive into [staging], accepting only `profile.json`
      * and the [ARCHIVED_DIRECTORIES] trees.
+     *
+     * Every entry is bounded three ways: the declared (central-directory) size,
+     * the bytes actually inflated, and a running total for the whole archive —
+     * a zip bomb has to beat all three to reach the disk.
      */
     private fun extractArchive(inputStream: InputStream, staging: File) {
         val base = staging.canonicalFile
+        var totalBytes = 0L
         ZipInputStream(BufferedInputStream(inputStream, COPY_BUFFER)).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
-                val name = normalizeEntryName(entry.name)
-                val target = targetFor(base, name)
-                if (!entry.isDirectory && isArchivedEntry(name)) {
-                    val parent = target.parentFile
-                    if (parent != null && !parent.isDirectory && !parent.mkdirs() && !parent.isDirectory) {
-                        throw IOException("Unable to create ${parent.absolutePath}")
+                try {
+                    val name = normalizeEntryName(entry.name)
+                    val target = targetFor(base, name)
+                    if (!entry.isDirectory && isArchivedEntry(name)) {
+                        // Trust nothing from the header: reject an obviously
+                        // oversized entry before a single byte is inflated.
+                        val declared = entry.size
+                        if (declared > MAX_ENTRY_BYTES) {
+                            throw IllegalArgumentException(
+                                "Zip entry ${entry.name} declares ${declared} bytes, over the " +
+                                    "${MAX_ENTRY_BYTES / (1024 * 1024)} MiB limit"
+                            )
+                        }
+                        val parent = target.parentFile
+                        if (parent != null && !parent.isDirectory && !parent.mkdirs() &&
+                            !parent.isDirectory
+                        ) {
+                            throw IOException("Unable to create ${parent.absolutePath}")
+                        }
+                        target.outputStream().use { sink ->
+                            totalBytes += copyEntry(zip, sink, totalBytes)
+                        }
                     }
-                    target.outputStream().use { sink -> copyEntry(zip, sink) }
+                } finally {
+                    // Always advance past the entry, even when it was skipped or
+                    // rejected mid-copy, so the inflater never carries state into
+                    // the next iteration.
+                    runCatching { zip.closeEntry() }
                 }
-                zip.closeEntry()
             }
         }
     }
@@ -322,7 +415,13 @@ class VmBackupManager(
         return ARCHIVED_DIRECTORIES.any { directory -> name.startsWith("$directory/") }
     }
 
-    private fun copyEntry(zip: ZipInputStream, sink: OutputStream) {
+    /**
+     * Streams the current entry into [sink], returning the bytes written.
+     *
+     * [alreadyWritten] is the archive-wide total so far, so a bomb spread over
+     * many small entries is stopped as well as a single huge one.
+     */
+    private fun copyEntry(zip: ZipInputStream, sink: OutputStream, alreadyWritten: Long): Long {
         val buffer = ByteArray(COPY_BUFFER)
         var written = 0L
         while (true) {
@@ -334,20 +433,33 @@ class VmBackupManager(
                     "Zip entry exceeds the ${MAX_ENTRY_BYTES / (1024 * 1024)} MiB limit"
                 )
             }
+            if (alreadyWritten + written > MAX_TOTAL_BYTES) {
+                throw IllegalArgumentException(
+                    "Archive exceeds the ${MAX_TOTAL_BYTES / (1024 * 1024)} MiB total limit"
+                )
+            }
             sink.write(buffer, 0, read)
         }
+        return written
     }
 
     private fun parseProfile(file: File): VmProfile {
+        if (file.length() > MAX_PROFILE_BYTES) {
+            throw IllegalArgumentException(
+                "$PROFILE_ENTRY is larger than the " +
+                    "${MAX_PROFILE_BYTES / (1024 * 1024)} MiB limit"
+            )
+        }
         val raw = runCatching { file.readText(Charsets.UTF_8) }
             .getOrElse { throw IllegalArgumentException("Unable to read $PROFILE_ENTRY", it) }
         if (raw.isBlank()) {
             throw IllegalArgumentException("$PROFILE_ENTRY is empty")
         }
-        return runCatching { json.decodeFromString<VmProfile>(raw) }
+        val parsed = runCatching { json.decodeFromString<VmProfile>(raw) }
             .getOrElse {
                 throw IllegalArgumentException("$PROFILE_ENTRY is not a valid NovaVM profile", it)
             }
+        return parsed
     }
 
     /**

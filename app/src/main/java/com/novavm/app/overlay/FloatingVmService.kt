@@ -61,6 +61,20 @@ class FloatingVmService : Service() {
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var dimmed = false
 
+    /**
+     * Set in [onDestroy].
+     *
+     * The start sequence resumes on a main-thread coroutine after IO hops; if the
+     * service is torn down meanwhile the continuation would otherwise add a
+     * window (or start a pipeline) onto an already destroyed service, leaving an
+     * overlay that nobody can remove.
+     */
+    @Volatile
+    private var destroyed = false
+
+    /** Running bubble edge-snap animator; cancelled whenever the bubble goes away. */
+    private var snapAnimator: ValueAnimator? = null
+
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(WindowManager::class.java)
@@ -79,7 +93,9 @@ class FloatingVmService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (!Settings.canDrawOverlays(this)) {
+        // `Settings.canDrawOverlays` can throw on some OEM builds (broken AppOps
+        // backend): treat any failure as "not granted" instead of crashing.
+        if (!canDrawOverlays()) {
             Toast.makeText(this, "需要悬浮窗权限才能显示虚拟机窗口", Toast.LENGTH_LONG).show()
             stopSelf()
             return START_NOT_STICKY
@@ -94,6 +110,7 @@ class FloatingVmService : Service() {
                 val vmId = requestedVmId ?: application.vmRepository.loadAll().firstOrNull()?.id
                 vmId?.let { application.vmRepository.get(it) }
             }
+            if (destroyed) return@launch
             if (loaded == null) {
                 Toast.makeText(this@FloatingVmService, "找不到虚拟机", Toast.LENGTH_SHORT).show()
                 stopSelf()
@@ -107,7 +124,13 @@ class FloatingVmService : Service() {
                     application.vmInstanceManager.start(loaded.id)
                 }
             }
+            if (destroyed) return@launch
             ensurePipeline(loaded)
+            if (destroyed) {
+                pipeline?.stopAsync()
+                pipeline = null
+                return@launch
+            }
             showWindow(loaded)
             notifyStatus(loaded)
         }
@@ -117,7 +140,10 @@ class FloatingVmService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        destroyed = true
         scope.cancel()
+        snapAnimator?.cancel()
+        snapAnimator = null
         removeWindow()
         removeBubble()
         pipeline?.stopAsync()
@@ -126,10 +152,13 @@ class FloatingVmService : Service() {
         super.onDestroy()
     }
 
+    private fun canDrawOverlays(): Boolean =
+        runCatching { Settings.canDrawOverlays(this) }.getOrDefault(false)
+
     // ------------------------------------------------------------ pipeline
 
     private fun ensurePipeline(profile: VmProfile) {
-        if (pipeline != null) return
+        if (destroyed || pipeline != null) return
         val dims = VmDisplayPipeline.fitDimensions(profile.hardware.width, profile.hardware.height)
         val display = VmDisplayPipeline(
             vmId = profile.id,
@@ -152,7 +181,7 @@ class FloatingVmService : Service() {
     // -------------------------------------------------------------- window
 
     private fun showWindow(profile: VmProfile) {
-        if (windowView != null) return
+        if (destroyed || windowView != null) return
         val root = buildWindowView(profile)
         val params = WindowManager.LayoutParams(
             dp(286),
@@ -170,15 +199,40 @@ class FloatingVmService : Service() {
         windowView = root
         runCatching { windowManager.addView(root, params) }.onFailure {
             Toast.makeText(this, "无法显示悬浮窗：${it.message}", Toast.LENGTH_LONG).show()
+            // Both references must be dropped together: a stale params object
+            // makes the drag/resize handlers write into a window that no longer
+            // exists.
             windowView = null
+            windowParams = null
             stopSelf()
         }
     }
 
     private fun removeWindow() {
-        windowView?.let { runCatching { windowManager.removeView(it) } }
+        detach(windowView, windowParams)
         windowView = null
         windowParams = null
+    }
+
+    /**
+     * Remove [view] from the window manager exactly once.
+     *
+     * `removeView` throws `IllegalArgumentException` when the view was already
+     * detached (double teardown, window manager restarted by the system), so the
+     * detach state is checked first and the call is still guarded.
+     */
+    private fun detach(view: View?, params: WindowManager.LayoutParams?) {
+        if (view == null || params == null) return
+        if (!view.isAttachedToWindow) return
+        runCatching { windowManager.removeView(view) }
+            .onFailure { runCatching { windowManager.removeViewImmediate(view) } }
+    }
+
+    /** `updateViewLayout` on a detached view throws; every call site goes here. */
+    private fun updateLayout(view: View?, params: WindowManager.LayoutParams?) {
+        if (view == null || params == null) return
+        if (!view.isAttachedToWindow) return
+        runCatching { windowManager.updateViewLayout(view, params) }
     }
 
     private fun buildWindowView(profile: VmProfile): View {
@@ -312,8 +366,7 @@ class FloatingVmService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     params.x = startX + (event.rawX - downRawX).toInt()
                     params.y = startY + (event.rawY - downRawY).toInt()
-                    val target = if (isBubble) bubbleView else windowView
-                    runCatching { target?.let { windowManager.updateViewLayout(it, params) } }
+                    updateLayout(if (isBubble) bubbleView else windowView, params)
                     true
                 }
                 MotionEvent.ACTION_UP -> {
@@ -348,7 +401,7 @@ class FloatingVmService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     params.width = (startWidth + (event.rawX - downRawX).toInt()).coerceIn(dp(220), dp(720))
                     params.height = (startHeight + (event.rawY - downRawY).toInt()).coerceIn(dp(280), dp(920))
-                    runCatching { windowManager.updateViewLayout(root, params) }
+                    updateLayout(root, params)
                     true
                 }
                 else -> false
@@ -382,6 +435,7 @@ class FloatingVmService : Service() {
     // -------------------------------------------------------------- bubble
 
     private fun collapseToBubble() {
+        if (destroyed) return
         removeWindow()
         if (bubbleView != null) return
         val bubble = TextView(this).apply {
@@ -409,10 +463,18 @@ class FloatingVmService : Service() {
         }
         bubbleParams = params
         bubbleView = bubble
-        runCatching {
+        val added = runCatching {
             windowManager.addView(bubble, params)
             attachDrag(bubble, isBubble = true)
-        }.onFailure { bubbleView = null }
+        }.isSuccess
+        if (!added) {
+            // Keep the two fields consistent: a half-added bubble would make the
+            // drag handler believe it owns a live window.
+            bubbleView = null
+            bubbleParams = null
+            toast("无法显示悬浮球")
+            return
+        }
         toast("已收起为悬浮球，点击恢复窗口")
     }
 
@@ -423,7 +485,9 @@ class FloatingVmService : Service() {
     }
 
     private fun removeBubble() {
-        bubbleView?.let { runCatching { windowManager.removeView(it) } }
+        snapAnimator?.cancel()
+        snapAnimator = null
+        detach(bubbleView, bubbleParams)
         bubbleView = null
         bubbleParams = null
     }
@@ -433,11 +497,13 @@ class FloatingVmService : Service() {
         val params = bubbleParams ?: return
         val screenWidth = resources.displayMetrics.widthPixels
         val targetX = if (params.x + params.width / 2 < screenWidth / 2) dp(6) else screenWidth - params.width - dp(6)
-        ValueAnimator.ofInt(params.x, targetX).apply {
+        snapAnimator?.cancel()
+        snapAnimator = ValueAnimator.ofInt(params.x, targetX).apply {
             duration = 180L
             addUpdateListener { animator ->
                 params.x = animator.animatedValue as Int
-                runCatching { windowManager.updateViewLayout(bubble, params) }
+                // The bubble may be removed mid-animation (restore / destroy).
+                updateLayout(bubble, params)
             }
             start()
         }
@@ -490,6 +556,7 @@ class FloatingVmService : Service() {
 
     /** Re-publishes the progress notification once the VM profile is resolved. */
     private fun notifyStatus(profile: VmProfile) {
+        if (destroyed) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
         runCatching {
             manager.notify(
@@ -553,7 +620,8 @@ class FloatingVmService : Service() {
 
         /** Permission-checked entry point used by the UI. */
         fun start(context: Context, vmId: String) {
-            if (!Settings.canDrawOverlays(context)) {
+            val granted = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
+            if (!granted) {
                 runCatching {
                     context.startActivity(
                         Intent(
@@ -567,7 +635,13 @@ class FloatingVmService : Service() {
             }
             val intent = Intent(context, FloatingVmService::class.java)
                 .putExtra(EXTRA_VM_ID, vmId)
-            ContextCompat.startForegroundService(context, intent)
+            // Android 12+ throws ForegroundServiceStartNotAllowedException when the
+            // app is in the background; the UI turns that into a toast instead of a
+            // crash of the calling screen.
+            runCatching { ContextCompat.startForegroundService(context, intent) }
+                .onFailure {
+                    Toast.makeText(context, "无法启动悬浮窗服务", Toast.LENGTH_SHORT).show()
+                }
         }
     }
 }

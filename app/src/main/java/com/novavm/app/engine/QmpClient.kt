@@ -116,6 +116,18 @@ class QmpClient(
     private val readTimeoutMs: Int = 5_000
 ) : Closeable {
 
+    private companion object {
+        /** Used when a caller passes a non-positive timeout (= "block forever"). */
+        const val FALLBACK_CONNECT_TIMEOUT_MS = 3_000
+        const val FALLBACK_READ_TIMEOUT_MS = 5_000
+
+        /** Stray empty lines tolerated between QMP messages before giving up. */
+        const val MAX_BLANK_LINES = 16
+
+        /** Non-response lines (events, garbage) skipped while awaiting a reply. */
+        const val MAX_SKIPPED_LINES = 256
+    }
+
     private var socket: Socket? = null
     private var reader: BufferedReader? = null
     private var writer: BufferedWriter? = null
@@ -133,11 +145,26 @@ class QmpClient(
     fun connect(): QmpResponse {
         synchronized(lock) {
             if (isConnected) throw QmpException("QMP client already connected")
+            // A previous attempt may have died between `connect()` and the
+            // handshake; drop whatever is left before opening a fresh socket.
+            closeQuietly()
+
+            val newSocket = Socket()
             try {
-                val newSocket = Socket()
                 newSocket.tcpNoDelay = true
-                newSocket.connect(InetSocketAddress(host, port), connectTimeoutMs)
-                newSocket.soTimeout = readTimeoutMs
+                val connectTimeout = if (connectTimeoutMs > 0) {
+                    connectTimeoutMs
+                } else {
+                    FALLBACK_CONNECT_TIMEOUT_MS
+                }
+                newSocket.connect(InetSocketAddress(host, port), connectTimeout)
+                // A zero/negative soTimeout means "wait forever", which turns a
+                // wedged QMP socket into a hung caller. Always bound reads.
+                newSocket.soTimeout = if (readTimeoutMs > 0) {
+                    readTimeoutMs
+                } else {
+                    FALLBACK_READ_TIMEOUT_MS
+                }
                 socket = newSocket
                 reader = BufferedReader(
                     InputStreamReader(newSocket.getInputStream(), StandardCharsets.UTF_8)
@@ -145,7 +172,11 @@ class QmpClient(
                 writer = BufferedWriter(
                     OutputStreamWriter(newSocket.getOutputStream(), StandardCharsets.UTF_8)
                 )
-            } catch (error: IOException) {
+            } catch (error: Throwable) {
+                // `socket` is only assigned after a successful connect, so the
+                // socket that just failed is closed explicitly instead of
+                // leaking one fd per failed attempt.
+                runCatching { newSocket.close() }
                 closeQuietly()
                 throw QmpException("Cannot connect to QMP at $host:$port", error)
             }
@@ -208,28 +239,51 @@ class QmpClient(
             closeQuietly()
             throw QmpException("Failed to write QMP command", error)
         }
-        do {
+        var skipped = 0
+        while (true) {
             val line = readLineOrThrow("QMP response")
             val response = QmpCommands.decode(line)
-            // Asynchronous events arrive between replies; skip them.
-            if (response.payload?.containsKey("event") == true) continue
+            val payload = response.payload
+            // Asynchronous events arrive between replies; skip them. A line that
+            // is not a JSON object at all is also not a reply, so it must not be
+            // handed back as a "successful" response with a null payload.
+            if (payload == null || payload.containsKey("event")) {
+                skipped++
+                if (skipped > MAX_SKIPPED_LINES) {
+                    closeQuietly()
+                    throw QmpException("QMP stream desynchronised after $skipped non-reply lines")
+                }
+                continue
+            }
             return response
-        } while (true)
+        }
     }
 
+    /**
+     * Reads one non-empty line. Blank lines are skipped (servers may emit stray
+     * CR/LF) but a long run of them means the peer is wedged, and any read
+     * failure closes the connection so a desynchronised socket is never reused.
+     */
     private fun readLineOrThrow(context: String): String {
         val input = reader ?: throw QmpException("QMP socket is closed")
-        val line = try {
-            input.readLine()
-        } catch (error: IOException) {
-            closeQuietly()
-            throw QmpException("Timed out reading $context", error)
-        } ?: run {
-            closeQuietly()
-            throw QmpException("QMP connection closed while reading $context")
+        var blankLines = 0
+        while (true) {
+            val line = try {
+                input.readLine()
+            } catch (error: IOException) {
+                closeQuietly()
+                throw QmpException("Timed out reading $context", error)
+            } ?: run {
+                closeQuietly()
+                throw QmpException("QMP connection closed while reading $context")
+            }
+            if (line.isNotBlank()) return line
+            blankLines++
+            if (blankLines > MAX_BLANK_LINES) {
+                closeQuietly()
+                throw QmpException("QMP peer kept sending empty lines while reading $context")
+            }
         }
-        if (line.isBlank()) throw QmpException("Empty $context")
-        return line
     }
 
     private fun ensureConnected() {

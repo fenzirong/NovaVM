@@ -1,5 +1,6 @@
 package com.novavm.app.ui.components
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.LruCache
 import androidx.compose.animation.core.RepeatMode
@@ -11,8 +12,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,10 +66,13 @@ import com.novavm.app.ui.theme.NovaPalette
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.floor
@@ -105,38 +110,94 @@ internal data class VisibleTile(
 )
 
 /**
- * In-memory raster tile cache. Bounded so long panning sessions cannot grow the
- * heap: ~96 tiles of 256x256 px are roughly 25 MB in the worst case.
+ * In-memory raster tile cache.
+ *
+ * Bounded twice over so a long panning session cannot grow the heap:
+ *  * the [LruCache] is sized in **bytes** (not entries), so oversized tiles are
+ *    evicted instead of quietly multiplying 256x256x4 allocations;
+ *  * downloads run through a [Semaphore], so a fast pinch-zoom cannot pile up
+ *    hundreds of half-open HTTP sockets (a cancelled `LaunchedEffect` does not
+ *    interrupt a blocking socket read).
  */
 internal object MapTileCache {
 
-    private const val MAX_TILES = 96
+    /** Soft byte budget for decoded tiles (~96 tiles of 256x256 ARGB_8888). */
+    private const val MAX_CACHE_BYTES = 24 * 1024 * 1024
 
-    val bitmaps: LruCache<String, ImageBitmap> = LruCache(MAX_TILES)
+    /** Simultaneous tile downloads; keeps sockets and decoder memory bounded. */
+    private const val MAX_CONCURRENT_DOWNLOADS = 4
+
+    /** Refuse absurdly large responses (broken proxy / HTML error page). */
+    private const val MAX_TILE_RESPONSE_BYTES = 2 * 1024 * 1024
+
+    /** Never decode a tile bigger than this on either edge. */
+    private const val MAX_DECODED_EDGE = 512
+
+    private val downloadPermits = Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+    val bitmaps: LruCache<String, ImageBitmap> = object : LruCache<String, ImageBitmap>(MAX_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: ImageBitmap): Int =
+            value.width * value.height * 4
+    }
 
     /** Downloads + decodes one tile; `null` on any failure (grid fallback). */
-    suspend fun load(source: MapTileSource, key: MapTileKey): ImageBitmap? =
-        withContext(Dispatchers.IO) {
-            val url = key.url() ?: return@withContext null
-            var connection: HttpURLConnection? = null
-            try {
-                connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 6_000
-                    readTimeout = 6_000
-                    instanceFollowRedirects = true
-                    requestMethod = "GET"
-                    setRequestProperty("User-Agent", "NovaVM/0.1")
+    suspend fun load(source: MapTileSource, key: MapTileKey): ImageBitmap? {
+        if (!source.requiresNetwork) return null
+        val url = key.url() ?: return null
+        return withContext(Dispatchers.IO) {
+            // Cancellation-aware: a cancelled coroutine releases the permit instead
+            // of leaking it into the pool.
+            downloadPermits.withPermit {
+                var connection: HttpURLConnection? = null
+                try {
+                    connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 6_000
+                        readTimeout = 6_000
+                        instanceFollowRedirects = true
+                        requestMethod = "GET"
+                        useCaches = false
+                        setRequestProperty("User-Agent", "NovaVM/0.1")
+                    }
+                    if (connection.responseCode !in 200..299) return@withPermit null
+                    val length = connection.contentLengthLong
+                    if (length > MAX_TILE_RESPONSE_BYTES) return@withPermit null
+                    val bytes = connection.inputStream.use { stream -> stream.readBytes() }
+                    decodeTile(bytes)
+                } catch (_: Exception) {
+                    null
+                } catch (_: OutOfMemoryError) {
+                    // One oversized tile must never take the process down.
+                    null
+                } finally {
+                    runCatching { connection?.disconnect() }
                 }
-                if (connection.responseCode !in 200..299) return@withContext null
-                connection.inputStream.use { stream ->
-                    BitmapFactory.decodeStream(stream)?.asImageBitmap()
-                }
-            } catch (_: Exception) {
-                null
-            } finally {
-                runCatching { connection?.disconnect() }
             }
         }
+    }
+
+    /**
+     * Bounds-checked decode. `BitmapFactory.decodeStream` happily allocates
+     * whatever the payload declares, so the header is read first and huge tiles
+     * are downsampled instead of OOM-ing the app.
+     */
+    private fun decodeTile(bytes: ByteArray): ImageBitmap? {
+        if (bytes.isEmpty() || bytes.size > MAX_TILE_RESPONSE_BYTES) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > MAX_DECODED_EDGE ||
+            bounds.outHeight / sampleSize > MAX_DECODED_EDGE
+        ) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
+        return bitmap.asImageBitmap()
+    }
 }
 
 /** Camera of the interactive map; mutable so gestures never recompose the tree. */
@@ -209,8 +270,12 @@ fun InteractiveGeoMap(
 
     LaunchedEffect(visibleTiles, tileSource) {
         if (!tileSource.requiresNetwork) return@LaunchedEffect
+        // Prune before downloading as well as after: during a pinch-zoom the
+        // effect restarts on every camera change, and pruning only at the end
+        // would let the state map grow without bound while tiles are in flight.
+        pruneTileState(tileBitmaps, visibleTiles)
         coroutineScope {
-            visibleTiles.take(32).forEach { tile ->
+            visibleTiles.take(MAX_TILES_PER_BATCH).forEach { tile ->
                 if (tileBitmaps.containsKey(tile.key.cacheKey)) return@forEach
                 launch {
                     val cached = MapTileCache.bitmaps.get(tile.key.cacheKey)
@@ -226,12 +291,7 @@ fun InteractiveGeoMap(
         }
         // Drop bitmaps of tiles that scrolled far away; the LRU cache keeps
         // them hot without pinning unbounded heap memory per composition.
-        if (tileBitmaps.size > 64) {
-            val visibleKeys = visibleTiles.map { it.key.cacheKey }.toSet()
-            tileBitmaps.keys.toList().forEach { key ->
-                if (key !in visibleKeys) tileBitmaps.remove(key)
-            }
-        }
+        pruneTileState(tileBitmaps, visibleTiles)
     }
 
     val pulse = rememberInfiniteTransition(label = "gps-pulse").animateFloat(
@@ -246,6 +306,13 @@ fun InteractiveGeoMap(
 
     val position = currentPoint ?: GeoPoint(centerLat, centerLon)
 
+    // `pointerInput(Unit)` keeps its lambda across recompositions, so these must be
+    // read through `rememberUpdatedState` — otherwise a tap keeps using the mode /
+    // callback captured on the very first composition.
+    val latestMode by rememberUpdatedState(interactionMode)
+    val latestPick by rememberUpdatedState(onPickLocation)
+    val latestAddWaypoint by rememberUpdatedState(onAddWaypoint)
+
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -259,83 +326,157 @@ fun InteractiveGeoMap(
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(Unit) {
-                    detectTapGestures { offset ->
+                    // One unified gesture loop. Two competing `pointerInput` blocks
+                    // (tap + transform) used to fight each other, and
+                    // `detectTransformGestures` consumed every drag, so the parent
+                    // scrollable column could never be scrolled from the map.
+                    //
+                    // Ownership rules:
+                    //  * tap            -> pick / add waypoint
+                    //  * horizontal drag-> pan the map (consumed)
+                    //  * vertical drag  -> left unconsumed so the parent scrolls
+                    //  * two fingers    -> pinch zoom + free pan (consumed)
+                    val slop = viewConfiguration.touchSlop
+
+                    fun applyPan(delta: Offset) {
+                        if (delta.x == 0f && delta.y == 0f) return
                         val width = size.width.toFloat()
                         val height = size.height.toFloat()
-                        if (width <= 0f || height <= 0f) return@detectTapGestures
-                        val picked = MapProjection.screenToLatLon(
-                            offset.x,
-                            offset.y,
+                        if (width <= 0f || height <= 0f) return
+                        val moved = MapProjection.screenToLatLon(
+                            width / 2f - delta.x,
+                            height / 2f - delta.y,
                             camera.latitude,
                             camera.longitude,
                             camera.zoom,
                             width,
                             height
                         )
-                        when (interactionMode) {
-                            MapInteractionMode.PICK -> onPickLocation(picked)
-                            MapInteractionMode.ROUTE -> onAddWaypoint(picked)
-                        }
+                        camera.latitude = MapProjection.clampLat(moved.latitude)
+                        camera.longitude = MapProjection.normalizeLon(moved.longitude)
                     }
-                }
-                .pointerInput(Unit) {
-                    detectTransformGestures { centroid, pan, gestureZoom, _ ->
+
+                    fun applyZoom(centroid: Offset, factor: Float) {
+                        if (factor <= 0f || factor == 1f) return
                         val width = size.width.toFloat()
                         val height = size.height.toFloat()
-                        if (width <= 0f || height <= 0f) return@detectTransformGestures
-                        var latitude = camera.latitude
-                        var longitude = camera.longitude
-                        var zoom = camera.zoom
+                        if (width <= 0f || height <= 0f) return
+                        val currentZoom = camera.zoom
+                        val nextZoom = MapProjection.clampZoom(currentZoom * factor)
+                        if (nextZoom == currentZoom) return
+                        val anchor = MapProjection.screenToLatLon(
+                            centroid.x,
+                            centroid.y,
+                            camera.latitude,
+                            camera.longitude,
+                            currentZoom,
+                            width,
+                            height
+                        )
+                        val (anchorX, anchorY) = MapProjection.latLonToScreen(
+                            anchor.latitude,
+                            anchor.longitude,
+                            camera.latitude,
+                            camera.longitude,
+                            nextZoom,
+                            width,
+                            height
+                        )
+                        val shifted = MapProjection.screenToLatLon(
+                            width / 2f + (anchorX - centroid.x),
+                            height / 2f + (anchorY - centroid.y),
+                            camera.latitude,
+                            camera.longitude,
+                            nextZoom,
+                            width,
+                            height
+                        )
+                        camera.latitude = MapProjection.clampLat(shifted.latitude)
+                        camera.longitude = MapProjection.normalizeLon(shifted.longitude)
+                        camera.zoom = nextZoom
+                    }
 
-                        if (pan.x != 0f || pan.y != 0f) {
-                            val moved = MapProjection.screenToLatLon(
-                                width / 2f - pan.x,
-                                height / 2f - pan.y,
-                                latitude,
-                                longitude,
-                                zoom,
-                                width,
-                                height
-                            )
-                            latitude = moved.latitude
-                            longitude = moved.longitude
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        var pastSlop = false
+                        var mapOwnsGesture = false
+                        var lastSinglePosition = down.position
+                        var lastCentroid: Offset? = null
+                        var lastDistance = 0f
+
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pressed = event.changes.filter { it.pressed }
+                            if (pressed.isEmpty()) break
+
+                            if (pressed.size >= 2) {
+                                // Compose 1.7.x: `currentPosition` only exists from 1.8;
+                                // `position` is the same "position in this event" value.
+                                val first = pressed[0].position
+                                val second = pressed[1].position
+                                val centroid = Offset(
+                                    (first.x + second.x) / 2f,
+                                    (first.y + second.y) / 2f
+                                )
+                                val distance = (first - second).getDistance()
+                                if (!pastSlop) {
+                                    pastSlop = true
+                                    mapOwnsGesture = true
+                                }
+                                if (mapOwnsGesture) {
+                                    if (lastDistance > 1f && distance > 1f) {
+                                        applyZoom(centroid, distance / lastDistance)
+                                    }
+                                    lastCentroid?.let { applyPan(centroid - it) }
+                                    event.changes.forEach { it.consume() }
+                                }
+                                lastCentroid = centroid
+                                lastDistance = distance
+                            } else {
+                                val change = pressed.first()
+                                val delta = change.position - lastSinglePosition
+                                lastSinglePosition = change.position
+                                if (!pastSlop) {
+                                    val total = change.position - down.position
+                                    if (total.getDistance() > slop) {
+                                        pastSlop = true
+                                        // Horizontal drags pan the map; vertical ones
+                                        // belong to the parent scrollable container.
+                                        mapOwnsGesture = abs(total.x) >= abs(total.y)
+                                    }
+                                }
+                                if (mapOwnsGesture) {
+                                    applyPan(delta)
+                                    change.consume()
+                                } else if (pastSlop) {
+                                    // The parent list owns this drag now: stop
+                                    // consuming so its scroll keeps working.
+                                    break
+                                }
+                                lastCentroid = null
+                                lastDistance = 0f
+                            }
                         }
-                        if (gestureZoom != 1f && gestureZoom > 0f) {
-                            val anchor = MapProjection.screenToLatLon(
-                                centroid.x,
-                                centroid.y,
-                                latitude,
-                                longitude,
-                                zoom,
-                                width,
-                                height
-                            )
-                            val nextZoom = MapProjection.clampZoom(zoom * gestureZoom)
-                            val (anchorX, anchorY) = MapProjection.latLonToScreen(
-                                anchor.latitude,
-                                anchor.longitude,
-                                latitude,
-                                longitude,
-                                nextZoom,
-                                width,
-                                height
-                            )
-                            val shifted = MapProjection.screenToLatLon(
-                                width / 2f + (anchorX - centroid.x),
-                                height / 2f + (anchorY - centroid.y),
-                                latitude,
-                                longitude,
-                                nextZoom,
-                                width,
-                                height
-                            )
-                            latitude = shifted.latitude
-                            longitude = shifted.longitude
-                            zoom = nextZoom
+
+                        if (!pastSlop) {
+                            val width = size.width.toFloat()
+                            val height = size.height.toFloat()
+                            if (width > 0f && height > 0f) {
+                                val picked = MapProjection.screenToLatLon(
+                                    down.position.x,
+                                    down.position.y,
+                                    camera.latitude,
+                                    camera.longitude,
+                                    camera.zoom,
+                                    width,
+                                    height
+                                )
+                                when (latestMode) {
+                                    MapInteractionMode.PICK -> latestPick(picked)
+                                    MapInteractionMode.ROUTE -> latestAddWaypoint(picked)
+                                }
+                            }
                         }
-                        camera.latitude = MapProjection.clampLat(latitude)
-                        camera.longitude = MapProjection.normalizeLon(longitude)
-                        camera.zoom = MapProjection.clampZoom(zoom)
                     }
                 }
         ) {
@@ -779,6 +920,31 @@ private fun MapSquareButton(label: String, onClick: () -> Unit) {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/** How many freshly visible tiles one camera change may fetch. */
+private const val MAX_TILES_PER_BATCH = 48
+
+/** Soft cap on the per-composition tile bitmap map. */
+private const val MAX_LIVE_TILES = 64
+
+/**
+ * Drops bitmaps of tiles that are no longer visible.
+ *
+ * Keeps the per-composition map bounded while panning: without this the map
+ * only grew (and every entry pinned an `ImageBitmap` outside the LRU budget).
+ */
+private fun pruneTileState(
+    tiles: MutableMap<String, ImageBitmap>,
+    visibleTiles: List<VisibleTile>
+) {
+    if (tiles.size <= MAX_LIVE_TILES) return
+    val visibleKeys = visibleTiles.mapTo(HashSet(visibleTiles.size), { it.key.cacheKey })
+    // Remove from a snapshot copy: mutating a SnapshotStateMap while iterating its
+    // keys throws ConcurrentModificationException.
+    tiles.keys.toList().forEach { key ->
+        if (key !in visibleKeys) tiles.remove(key)
+    }
+}
 
 private fun formatLatLon(value: Double): String =
     String.format(Locale.US, "%.5f", value)

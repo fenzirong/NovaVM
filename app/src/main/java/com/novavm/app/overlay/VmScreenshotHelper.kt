@@ -50,6 +50,16 @@ object VmScreenshotHelper {
     private const val PNG_MIME = "image/png"
     private const val BYTES_PER_PIXEL = 4
 
+    /**
+     * 单帧像素预算（64 MiB ≈ 4096x4096 RGBA）。
+     *
+     * 超过这个尺寸的帧在 `Bitmap.createBitmap` 阶段必然触发 `OutOfMemoryError`，
+     * 而 OOM 往往发生在相册条目已经 `insert` 之后：轻则留下无法清理的半成品，
+     * 重则把整个应用堆打崩。提前抛 `IllegalStateException`，让调用方拿到可读
+     * 错误而不是让进程崩掉。
+     */
+    private const val MAX_FRAME_BYTES = 64L * 1024L * 1024L
+
     /** 固定 UTC，保证同一时间戳在任何机器/时区生成同样的文件名。 */
     private val timestampFormatter: DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss", Locale.US).withZone(ZoneOffset.UTC)
@@ -119,15 +129,9 @@ object VmScreenshotHelper {
             }
         }
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        try {
-            bitmap.copyPixelsFromBuffer(pixels)
-            FileOutputStream(targetFile).use { out ->
-                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) { "PNG 编码失败" }
-                out.flush()
-            }
-        } finally {
-            bitmap.recycle()
+        // `use` 兜底关闭流：writePng 内部的尺寸/预算校验抛异常时不会泄漏 fd。
+        FileOutputStream(targetFile).use { out ->
+            writePng(pixels, width, height, out)
         }
         return targetFile
     }
@@ -152,6 +156,9 @@ object VmScreenshotHelper {
         val required = width.toLong() * height.toLong() * BYTES_PER_PIXEL
         require(rgbaBytes.size.toLong() >= required) {
             "截图字节数 ${rgbaBytes.size} 不足，${width}x$height 需要 $required 字节"
+        }
+        check(required <= MAX_FRAME_BYTES) {
+            "截图帧过大：${width}x$height 需要 $required 字节，上限 $MAX_FRAME_BYTES 字节"
         }
         val fileName = buildScreenshotFileName(vmName, System.currentTimeMillis())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -187,17 +194,27 @@ object VmScreenshotHelper {
         try {
             val out = resolver.openOutputStream(uri, "w")
                 ?: throw IllegalStateException("无法打开 MediaStore 输出流")
-            out.use { writePng(rgbaBytes, width, height, it) }
-            // 写完清 pending 标记，相册里才可见。
-            values.clear()
-            values.put(MediaStore.Images.Media.IS_PENDING, 0)
-            resolver.update(uri, values, null, null)
+            writePng(ByteBuffer.wrap(rgbaBytes), width, height, out)
+            // 写完清 pending 标记，相册里才可见。部分 provider 对 update 返回 0
+            // 但实际生效，因此重试一次后再断言，避免留下「不可见 + 无法清理」的
+            // 孤儿 pending 条目。
+            if (!clearPending(resolver, uri)) {
+                if (!clearPending(resolver, uri)) {
+                    throw IllegalStateException("MediaStore 未能清除 IS_PENDING，截图不会出现在相册")
+                }
+            }
         } catch (t: Throwable) {
-            // 半成品必须删掉，否则相册里会留 0 字节/损坏条目。
+            // 半成品必须删掉，否则相册里会留 0 字节/损坏/永远 pending 的条目。
             runCatching { resolver.delete(uri, null, null) }
             throw t
         }
         return uri.toString()
+    }
+
+    /** 清除 `IS_PENDING`；返回 provider 是否报告了已更新的行。 */
+    private fun clearPending(resolver: android.content.ContentResolver, uri: android.net.Uri): Boolean {
+        val pending = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+        return runCatching { resolver.update(uri, pending, null, null) > 0 }.getOrDefault(false)
     }
 
     @Suppress("DEPRECATION")
@@ -224,16 +241,41 @@ object VmScreenshotHelper {
         return target.absolutePath
     }
 
-    /** 字节 → Bitmap → PNG 流；不落临时文件，失败也要回收位图。 */
-    private fun writePng(rgbaBytes: ByteArray, width: Int, height: Int, out: OutputStream) {
-        val pixels = ByteBuffer.wrap(rgbaBytes).order(ByteOrder.LITTLE_ENDIAN)
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    /**
+     * 像素 buffer → Bitmap → PNG 流；不落临时文件，失败也要回收位图并关闭流。
+     *
+     * buffer 剩余字节数在这里再校验一次（MediaStore 路径的调用方只校验了
+     * `ByteArray` 长度，buffer 的 position/limit 可能已被上游改动）：
+     * `copyPixelsFromBuffer` 读不够会抛 `RuntimeException`，而此处的位图已经
+     * 分配到堆上，必须在抛出前释放。
+     */
+    private fun writePng(pixels: ByteBuffer, width: Int, height: Int, out: OutputStream) {
+        // 任何分支（含尺寸/预算校验）都要关闭输出流，否则 MediaStore / 文件
+        // 描述符会在失败重试时累积泄漏。
         try {
-            bitmap.copyPixelsFromBuffer(pixels)
-            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) { "PNG 编码失败" }
-            out.flush()
+            val required = width.toLong() * height.toLong() * BYTES_PER_PIXEL
+            require(pixels.remaining().toLong() >= required) {
+                "RGBA buffer 只有 ${pixels.remaining()} 字节，${width}x$height 需要 $required 字节"
+            }
+            check(required <= MAX_FRAME_BYTES) {
+                "截图帧过大：${width}x$height 需要 $required 字节，上限 $MAX_FRAME_BYTES 字节"
+            }
+            val bitmap = try {
+                Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            } catch (_: OutOfMemoryError) {
+                throw IllegalStateException("内存不足，无法分配 ${width}x$height 的截屏位图")
+            }
+            try {
+                bitmap.copyPixelsFromBuffer(pixels)
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) { "PNG 编码失败" }
+                out.flush()
+            } catch (_: OutOfMemoryError) {
+                throw IllegalStateException("内存不足，${width}x$height 截屏编码失败")
+            } finally {
+                bitmap.recycle()
+            }
         } finally {
-            bitmap.recycle()
+            runCatching { out.close() }
         }
     }
 }

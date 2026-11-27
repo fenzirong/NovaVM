@@ -22,6 +22,12 @@ object VmosFeatureInjector {
     const val EXTENSION_SCRIPT_NAME = "novavm_vmos_ext.sh"
     const val SHARED_DIR_NAME = "shared"
 
+    /** Longest Android package identifier accepted into the DenyList. */
+    private const val MAX_PACKAGE_NAME_LENGTH = 255
+
+    /** Upper bound for a single `resetprop` value written into the script. */
+    private const val MAX_PROP_VALUE_LENGTH = 512
+
     /**
      * Builds `novavm_vmos_ext.sh` from the four feature configs.
      *
@@ -166,7 +172,13 @@ object VmosFeatureInjector {
     }
 
     private fun StringBuilder.appendZygiskDenyList(gms: GmsConfig) {
-        val packages = gms.zygiskDenyList.filter { it.isNotBlank() }.distinct()
+        // Package names are pasted into a root shell script. Anything that is
+        // not a legal package identifier is dropped here instead of relying on
+        // the quoting below alone.
+        val packages = gms.zygiskDenyList
+            .map { it.trim() }
+            .filter { isValidPackageName(it) }
+            .distinct()
         appendLine("# --- Zygisk DenyList staging ---")
         appendLine("ZYGISK_DIR=\"/data/adb/zygisksu\"")
         appendLine("DENYLIST_FILE=\"\$ZYGISK_DIR/novavm_denylist.txt\"")
@@ -186,6 +198,21 @@ object VmosFeatureInjector {
         )
         appendLine("")
     }
+
+    /**
+     * Android package identifiers are ASCII letters/digits separated by `.` and
+     * `_`, never starting with a digit or a separator.
+     */
+    internal fun isValidPackageName(value: String): Boolean {
+        if (value.isEmpty() || value.length > MAX_PACKAGE_NAME_LENGTH) return false
+        if (!value.first().isAsciiLetter()) return false
+        return value.all { ch ->
+            ch.isAsciiLetter() || ch in '0'..'9' || ch == '.' || ch == '_'
+        }
+    }
+
+    private fun Char.isAsciiLetter(): Boolean =
+        this in 'a'..'z' || this in 'A'..'Z'
 
     // -------------------------------------------------------------- sensors
 
@@ -246,8 +273,11 @@ object VmosFeatureInjector {
     // --------------------------------------------------------------- helpers
 
     private fun StringBuilder.appendProp(key: String, value: String) {
-        if (value.isBlank()) return
-        appendLine("resetprop $key ${shellQuote(value)}")
+        val quoted = shellQuote(value)
+        // Quoting a value made only of control characters yields `""`, which
+        // would clear the property instead of leaving the stock value alone.
+        if (quoted == "\"\"") return
+        appendLine("resetprop $key $quoted")
     }
 
     private fun StringBuilder.appendFlag(key: String, enabled: Boolean) {
@@ -260,10 +290,30 @@ object VmosFeatureInjector {
         return (safe * 10f).roundToInt()
     }
 
-    /** Quotes one value for a POSIX shell double-quoted string. */
+    /**
+     * Quotes one value for a POSIX shell double-quoted string.
+     *
+     * `\`, `"`, `$` and `` ` `` are the only characters that keep a meaning
+     * inside `"…"`, so they are escaped; every other control character is
+     * removed (line breaks become spaces) so a UI-supplied SSID, carrier name or
+     * contact field cannot terminate the line it is written on.
+     */
     private fun shellQuote(value: String): String {
-        val singleLine = value.replace('\r', ' ').replace('\n', ' ')
-        val escaped = singleLine
+        val capped = if (value.length > MAX_PROP_VALUE_LENGTH) {
+            value.substring(0, MAX_PROP_VALUE_LENGTH)
+        } else {
+            value
+        }
+        val sanitized = buildString(capped.length) {
+            capped.forEach { ch ->
+                when {
+                    ch == '\n' || ch == '\r' || ch == '\t' -> append(' ')
+                    ch < ' ' || ch == '\u007F' -> Unit
+                    else -> append(ch)
+                }
+            }
+        }
+        val escaped = sanitized
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
             .replace("\$", "\\\$")

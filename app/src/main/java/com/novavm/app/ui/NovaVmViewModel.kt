@@ -299,8 +299,11 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
 
     fun deleteVm(vmId: String) {
         io {
+            // Tear the playback down *before* the profile disappears: after the
+            // deletion `stopAndReset` can no longer resolve the profile, and a
+            // leftover ticker would resurrect the deleted VM's GPS state.
+            app.routeSimulator.forget(vmId)
             val removed = onDisk { app.vmInstanceManager.deleteProfile(vmId) }
-            if (removed) app.routeSimulator.forget(vmId)
             if (_state.value.selectedVmId == vmId) {
                 _state.update { it.copy(selectedVmId = null, sharedFiles = emptyList(), consoleLog = emptyList()) }
             }
@@ -328,6 +331,9 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
     fun stopVm(vmId: String) {
         io {
             val stopped = app.vmInstanceManager.stop(vmId)
+            // A stopped VM must not keep ticking: the simulator would otherwise
+            // keep rewriting the profile and re-syncing NMEA for a dead instance.
+            if (stopped) app.routeSimulator.stopAndReset(vmId)
             _state.update {
                 it.copy(runtimes = app.vmInstanceManager.states.value.associateBy { s -> s.vmId })
             }
@@ -597,8 +603,15 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * Writes [text] to `shared/clipboard.txt`, the file the guest-side bridge
      * polls so the VM clipboard follows the host clipboard.
+     *
+     * An empty host clipboard is a no-op: overwriting the guest clipboard file
+     * with zero bytes would silently wipe whatever the guest had copied.
      */
     fun syncHostClipboardToVm(vmId: String, text: String) {
+        if (text.isEmpty()) {
+            toast("本机剪切板为空，未同步", isError = true)
+            return
+        }
         io {
             val target = onDisk {
                 app.transferManagerFor(vmId).importFile(
@@ -907,26 +920,35 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
     fun importRom(uri: Uri, architecture: VmArchitecture) {
         _state.update { it.copy(loading = true) }
         io {
-            val name = displayName(uri)
-            val rom = onDisk {
-                val input = app.contentResolver.openInputStream(uri)
-                    ?: error("无法读取所选文件")
-                app.romRepository.importRom(
-                    input = input,
-                    fileName = name,
-                    displayName = name,
-                    architecture = architecture
-                )
+            try {
+                val name = displayName(uri)
+                val rom = onDisk {
+                    // `use {}` guarantees the SAF descriptor is released even when
+                    // the copy throws, which otherwise leaks an fd per attempt.
+                    val input = app.contentResolver.openInputStream(uri)
+                        ?: error("无法读取所选文件")
+                    input.use {
+                        app.romRepository.importRom(
+                            input = it,
+                            fileName = name,
+                            displayName = name,
+                            architecture = architecture
+                        )
+                    }
+                }
+                val probe = onDisk { NativeEngine.probeDiskImage(rom.absolutePath) }
+                _state.update {
+                    it.copy(
+                        importedRoms = it.importedRoms + rom,
+                        romProbes = it.romProbes + (rom.id to probe),
+                        loading = false
+                    )
+                }
+                toast("镜像已导入：${rom.displayName}")
+            } finally {
+                // Failure path: never leave the wizard stuck behind a spinner.
+                _state.update { it.copy(loading = false) }
             }
-            val probe = onDisk { NativeEngine.probeDiskImage(rom.absolutePath) }
-            _state.update {
-                it.copy(
-                    importedRoms = it.importedRoms + rom,
-                    romProbes = it.romProbes + (rom.id to probe),
-                    loading = false
-                )
-            }
-            toast("镜像已导入：${rom.displayName}")
         }
     }
 
@@ -996,30 +1018,36 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
     fun importSharedFile(vmId: String, uri: Uri) {
         _state.update { it.copy(loading = true) }
         io {
-            val name = displayName(uri)
-            val target = onDisk {
-                val input = app.contentResolver.openInputStream(uri)
-                    ?: error("无法读取所选文件")
-                app.transferManagerFor(vmId).importFile(input, name)
+            try {
+                val name = displayName(uri)
+                val target = onDisk {
+                    val input = app.contentResolver.openInputStream(uri)
+                        ?: error("无法读取所选文件")
+                    input.use { app.transferManagerFor(vmId).importFile(it, name) }
+                }
+                reloadSelected()
+                toast("已导入到共享目录：${target.name}")
+            } finally {
+                _state.update { it.copy(loading = false) }
             }
-            reloadSelected()
-            _state.update { it.copy(loading = false) }
-            toast("已导入到共享目录：${target.name}")
         }
     }
 
     fun pushApk(vmId: String, uri: Uri) {
         _state.update { it.copy(loading = true) }
         io {
-            val name = displayName(uri)
-            val staged = onDisk {
-                val input = app.contentResolver.openInputStream(uri)
-                    ?: error("无法读取所选文件")
-                app.transferManagerFor(vmId).stageApk(input, name)
+            try {
+                val name = displayName(uri)
+                val staged = onDisk {
+                    val input = app.contentResolver.openInputStream(uri)
+                        ?: error("无法读取所选文件")
+                    input.use { app.transferManagerFor(vmId).stageApk(it, name) }
+                }
+                reloadSelected()
+                toast("APK 已推送：${staged.name}")
+            } finally {
+                _state.update { it.copy(loading = false) }
             }
-            reloadSelected()
-            _state.update { it.copy(loading = false) }
-            toast("APK 已推送：${staged.name}")
         }
     }
 
@@ -1055,7 +1083,7 @@ class NovaVmViewModel(application: Application) : AndroidViewModel(application) 
             val staged = onDisk {
                 val input = app.contentResolver.openInputStream(uri)
                     ?: error("无法读取所选文件")
-                configurator.stageModule(input, name)
+                input.use { configurator.stageModule(it, name) }
             }
             val config = profile.rootXposed.copy(
                 stagedModules = (profile.rootXposed.stagedModules + staged.name).distinct()

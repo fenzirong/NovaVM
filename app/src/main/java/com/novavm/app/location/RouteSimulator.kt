@@ -7,6 +7,7 @@ import com.novavm.app.data.VirtualLocationMode
 import com.novavm.app.data.VmProfile
 import com.novavm.app.data.VmRepository
 import com.novavm.app.engine.VmInstanceManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -299,7 +300,14 @@ class RouteSimulator(
 
         synchronized(lock) {
             jobs.remove(vmId)?.cancel()
-            val step = steps.getOrPut(vmId) { RouteStepState() }
+            // A cursor left `finished` by a previous ONCE run would park the route
+            // at its last waypoint forever: restarting must rewind it.
+            val existing = steps[vmId]
+            val step = if (existing == null || existing.finished) {
+                RouteStepState().also { steps[vmId] = it }
+            } else {
+                existing
+            }
             val fix = RouteStepper.currentFix(waypoints, step, config.loopMode)
             publish(playbackOf(profile, step, fix, isPlaying = true))
             jobs[vmId] = scope.launch { tick(vmId) }
@@ -310,15 +318,16 @@ class RouteSimulator(
     /** Stops ticking but keeps the cursor so [start] resumes from the same point. */
     fun pause(vmId: String): Boolean {
         val profile = repository.get(vmId) ?: return false
+        val config = profile.virtualLocation
+        val waypoints = config.routeWaypoints
+        if (waypoints.size < 2 || GeoMath.totalRouteDistanceMeters(waypoints) <= 0.0) return false
         synchronized(lock) {
-            val job = jobs.remove(vmId) ?: return false
-            job.cancel()
-            val step = steps[vmId] ?: RouteStepState()
-            val fix = RouteStepper.currentFix(
-                profile.virtualLocation.routeWaypoints,
-                step,
-                profile.virtualLocation.loopMode
-            )
+            // A missing job means playback already stopped (finished ONCE route, or
+            // a ticker that removed itself). Publishing the paused snapshot is
+            // still correct and keeps callers from mis-reporting "no route".
+            jobs.remove(vmId)?.cancel()
+            val step = steps.getOrPut(vmId) { RouteStepState() }
+            val fix = RouteStepper.currentFix(waypoints, step, config.loopMode)
             publish(playbackOf(profile, step, fix, isPlaying = false))
         }
         return true
@@ -360,13 +369,35 @@ class RouteSimulator(
 
     // ----------------------------------------------------------------- tick
 
+    /**
+     * Playback ticker.
+     *
+     * The ticker unregisters itself in `finally`, but only if it is still the
+     * *current* job for [vmId]: an older ticker finishing after a restart must not
+     * delete the freshly registered job, otherwise `pause()` / `stopAndReset()`
+     * find nothing to cancel and the tick loop keeps running forever.
+     */
     private suspend fun tick(vmId: String) {
-        while (currentCoroutineContext().isActive) {
-            delay(tickMillis)
-            val keepRunning = runCatching { advanceOnce(vmId) }.getOrDefault(false)
-            if (!keepRunning) break
+        val self = currentCoroutineContext()[Job]
+        try {
+            while (currentCoroutineContext().isActive) {
+                delay(tickMillis)
+                val keepRunning = try {
+                    advanceOnce(vmId)
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (_: Throwable) {
+                    // A single failed step (disk/engine hiccup) must not kill the
+                    // ticker, but it must not swallow coroutine cancellation either.
+                    false
+                }
+                if (!keepRunning) break
+            }
+        } finally {
+            synchronized(lock) {
+                if (self != null && jobs[vmId] === self) jobs.remove(vmId)
+            }
         }
-        synchronized(lock) { jobs.remove(vmId) }
     }
 
     /**

@@ -59,10 +59,14 @@ class KeepAliveService : Service() {
      * `acquire(timeout)` 带超时是为了「永不泄漏」：即使进程被强杀、`onDestroy`
      * 没来得及执行，系统也会在超时后自动释放。代价是长挂机需要定期续期，
      * 所以每 [WAKE_LOCK_TIMEOUT_MS] / 2 重新获取一次。
+     *
+     * 续期必须走 `renew = true`（先释放再获取）：已持有的超时锁无法通过再次
+     * `acquire()` 延长超时，若只重新 `acquire` 会让锁在原超时点静默失效，
+     * 最长留下 [WAKE_LOCK_TIMEOUT_MS] / 2 的窗口 CPU 被系统冻结。
      */
     private val reArmWakeLock = object : Runnable {
         override fun run() {
-            acquireWakeLock()
+            acquireWakeLock(renew = true)
             mainHandler.postDelayed(this, WAKE_LOCK_TIMEOUT_MS / 2)
         }
     }
@@ -79,14 +83,27 @@ class KeepAliveService : Service() {
         ensureNotificationChannel()
         runningCount = (intent?.getIntExtra(EXTRA_RUNNING_COUNT, runningCount) ?: runningCount)
             .coerceAtLeast(0)
-        startForeground(NOTIFICATION_ID, buildNotification(runningCount))
-        markRunning(true)
 
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
+        // 通知被系统禁用 / 前台服务启动不被允许时 startForeground 会抛异常；
+        // 让它冒泡会直接崩掉整个应用进程，这里降级为「安静地退出」。
+        val promoted = runCatching {
+            startForeground(NOTIFICATION_ID, buildNotification(runningCount))
+        }.isSuccess
+        if (!promoted) {
+            stopTicking()
+            markRunning(false)
+            stopSelf(startId)
             return START_NOT_STICKY
         }
 
+        if (intent?.action == ACTION_STOP) {
+            stopTicking()
+            markRunning(false)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+
+        markRunning(true)
         acquireWakeLock()
         mainHandler.removeCallbacks(reArmWakeLock)
         mainHandler.postDelayed(reArmWakeLock, WAKE_LOCK_TIMEOUT_MS / 2)
@@ -97,29 +114,46 @@ class KeepAliveService : Service() {
 
     /** 从最近任务划掉时保持存活（挂机场景的预期行为）。 */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // START_STICKY 会拉起进程；这里只补一次续期，不重启任何 Activity。
-        acquireWakeLock()
+        // START_STICKY 会拉起进程；这里只补一次续期，并把续期任务重新挂上，
+        // 避免「进程被重新创建但没有再次走 onStartCommand」导致锁到期后不再续期。
+        acquireWakeLock(renew = true)
+        mainHandler.removeCallbacks(reArmWakeLock)
+        mainHandler.postDelayed(reArmWakeLock, WAKE_LOCK_TIMEOUT_MS / 2)
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
+        stopTicking()
+        markRunning(false)
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        super.onDestroy()
+    }
+
+    /** 取消续期任务并释放 wake lock；可重复调用，不会重复 release。 */
+    private fun stopTicking() {
         mainHandler.removeCallbacks(reArmWakeLock)
         releaseWakeLock()
-        markRunning(false)
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        super.onDestroy()
     }
 
     // ------------------------------------------------------------ wake lock
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
+    /**
+     * 获取（或续期）wake lock。
+     *
+     * [renew] 用于周期性续期：`acquire(timeout)` 的超时无法延长，已持有且
+     * 非引用计数的锁必须释放后重新获取。释放与获取都在主线程同步完成，
+     * 中间不存在可被调度器插入的挂起点。
+     */
+    private fun acquireWakeLock(renew: Boolean = false) {
+        if (!renew && wakeLock?.isHeld == true) return
         val powerManager = getSystemService(PowerManager::class.java) ?: return
+        if (renew) releaseWakeLock()
         val lock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
         // 非引用计数：重复 acquire/release 不会互相抵消，也不会因计数错乱而泄漏。
         lock.setReferenceCounted(false)
         runCatching { lock.acquire(WAKE_LOCK_TIMEOUT_MS) }
             .onSuccess { wakeLock = lock }
+            .onFailure { runCatching { if (lock.isHeld) lock.release() } }
     }
 
     private fun releaseWakeLock() {

@@ -257,14 +257,17 @@ fun VmDetailScreen(
 
 @Composable
 private fun HardwareTab(profile: VmProfile, vm: NovaVmViewModel) {
-    var cpu by remember(profile.id) { mutableStateOf(profile.hardware.cpuCores) }
-    var ram by remember(profile.id) { mutableStateOf(profile.hardware.ramMb) }
-    var disk by remember(profile.id) { mutableStateOf(profile.hardware.diskSizeGb) }
-    var dpi by remember(profile.id) { mutableStateOf(profile.hardware.dpi) }
-    var fps by remember(profile.id) { mutableStateOf(profile.hardware.targetFps) }
-    var width by remember(profile.id) { mutableStateOf(profile.hardware.width) }
-    var height by remember(profile.id) { mutableStateOf(profile.hardware.height) }
-    var gpu by remember(profile.id) { mutableStateOf(profile.hardware.gpuMode) }
+    // Keyed on the persisted sub-config, not just the id: an external update to
+    // `profile.hardware` must re-sync the form instead of leaving stale drafts.
+    val saved = profile.hardware
+    var cpu by remember(profile.id, saved) { mutableStateOf(saved.cpuCores) }
+    var ram by remember(profile.id, saved) { mutableStateOf(saved.ramMb) }
+    var disk by remember(profile.id, saved) { mutableStateOf(saved.diskSizeGb) }
+    var dpi by remember(profile.id, saved) { mutableStateOf(saved.dpi) }
+    var fps by remember(profile.id, saved) { mutableStateOf(saved.targetFps) }
+    var width by remember(profile.id, saved) { mutableStateOf(saved.width) }
+    var height by remember(profile.id, saved) { mutableStateOf(saved.height) }
+    var gpu by remember(profile.id, saved) { mutableStateOf(saved.gpuMode) }
 
     val presets = listOf(720 to 1280, 1080 to 1920, 1080 to 2400, 1280 to 720)
 
@@ -363,17 +366,20 @@ private fun HardwareTab(profile: VmProfile, vm: NovaVmViewModel) {
 
 @Composable
 private fun SpoofTab(profile: VmProfile, vm: NovaVmViewModel) {
-    var enabled by remember(profile.id) { mutableStateOf(profile.deviceSpoof.enabled) }
-    var presetName by remember(profile.id) { mutableStateOf(profile.deviceSpoof.presetName) }
-    var brand by remember(profile.id) { mutableStateOf(profile.deviceSpoof.brand) }
-    var manufacturer by remember(profile.id) { mutableStateOf(profile.deviceSpoof.manufacturer) }
-    var model by remember(profile.id) { mutableStateOf(profile.deviceSpoof.model) }
-    var device by remember(profile.id) { mutableStateOf(profile.deviceSpoof.device) }
-    var board by remember(profile.id) { mutableStateOf(profile.deviceSpoof.board) }
-    var imei by remember(profile.id) { mutableStateOf(profile.deviceSpoof.imei) }
-    var androidId by remember(profile.id) { mutableStateOf(profile.deviceSpoof.androidId) }
-    var wifiMac by remember(profile.id) { mutableStateOf(profile.deviceSpoof.wifiMac) }
-    var fingerprint by remember(profile.id) { mutableStateOf(profile.deviceSpoof.buildFingerprint) }
+    // 一键新机 / 随机指纹 / 预设切换 all rewrite `profile.deviceSpoof` externally;
+    // keying on the value keeps the identity fields in step with what is on disk.
+    val saved = profile.deviceSpoof
+    var enabled by remember(profile.id, saved) { mutableStateOf(saved.enabled) }
+    var presetName by remember(profile.id, saved) { mutableStateOf(saved.presetName) }
+    var brand by remember(profile.id, saved) { mutableStateOf(saved.brand) }
+    var manufacturer by remember(profile.id, saved) { mutableStateOf(saved.manufacturer) }
+    var model by remember(profile.id, saved) { mutableStateOf(saved.model) }
+    var device by remember(profile.id, saved) { mutableStateOf(saved.device) }
+    var board by remember(profile.id, saved) { mutableStateOf(saved.board) }
+    var imei by remember(profile.id, saved) { mutableStateOf(saved.imei) }
+    var androidId by remember(profile.id, saved) { mutableStateOf(saved.androidId) }
+    var wifiMac by remember(profile.id, saved) { mutableStateOf(saved.wifiMac) }
+    var fingerprint by remember(profile.id, saved) { mutableStateOf(saved.buildFingerprint) }
 
     fun applyPreset(preset: DeviceSpoofConfig) {
         val generated = DeviceSpoofGenerator.forPreset(preset)
@@ -553,15 +559,20 @@ private fun IdentityRow(label: String, value: String) {
 
 @Composable
 private fun RootTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel) {
-    var rootEnabled by remember(profile.id) { mutableStateOf(profile.rootXposed.rootEnabled) }
-    var xposedEnabled by remember(profile.id) { mutableStateOf(profile.rootXposed.xposedEnabled) }
-    var selinux by remember(profile.id) { mutableStateOf(profile.rootXposed.selinuxPermissive) }
-    var magiskHide by remember(profile.id) { mutableStateOf(profile.rootXposed.magiskHideEnabled) }
+    // Same rule as the other tabs: re-sync from the persisted sub-config so a
+    // save (or a module import that rewrites `stagedModules`) lands in the UI.
+    val savedRoot = profile.rootXposed
+    var rootEnabled by remember(profile.id, savedRoot) { mutableStateOf(savedRoot.rootEnabled) }
+    var xposedEnabled by remember(profile.id, savedRoot) { mutableStateOf(savedRoot.xposedEnabled) }
+    var selinux by remember(profile.id, savedRoot) { mutableStateOf(savedRoot.selinuxPermissive) }
+    var magiskHide by remember(profile.id, savedRoot) { mutableStateOf(savedRoot.magiskHideEnabled) }
 
-    var gmsEnabled by remember(profile.id) { mutableStateOf(profile.gms.enabled) }
-    var microGMode by remember(profile.id) { mutableStateOf(profile.gms.microGMode) }
-    var playStore by remember(profile.id) { mutableStateOf(profile.gms.playStoreEnabled) }
-    var denyList by remember(profile.id) { mutableStateOf(profile.gms.zygiskDenyList) }
+    val savedGms = profile.gms
+    var gmsEnabled by remember(profile.id, savedGms) { mutableStateOf(savedGms.enabled) }
+    var microGMode by remember(profile.id, savedGms) { mutableStateOf(savedGms.microGMode) }
+    var playStore by remember(profile.id, savedGms) { mutableStateOf(savedGms.playStoreEnabled) }
+    var denyList by remember(profile.id, savedGms) { mutableStateOf(savedGms.zygiskDenyList) }
+    // Draft text must survive config refreshes, so it only follows the VM id.
     var newDenyPackage by remember(profile.id) { mutableStateOf("") }
 
     val modulePicker = rememberLauncherForActivityResult(
@@ -769,8 +780,12 @@ private fun RootTab(profile: VmProfile, state: NovaUiState, vm: NovaVmViewModel)
 private fun VmosTab(profile: VmProfile, vm: NovaVmViewModel) {
     val context = LocalContext.current
 
-    var keepAlive by remember(profile.id) { mutableStateOf(profile.keepAlive) }
-    var sensors by remember(profile.id) { mutableStateOf(profile.sensors) }
+    // Keep-alive / sensor toggles persist immediately, so the local draft has to
+    // follow the stored value or the switches desync from the profile.
+    val savedKeepAlive = profile.keepAlive
+    var keepAlive by remember(profile.id, savedKeepAlive) { mutableStateOf(savedKeepAlive) }
+    val savedSensors = profile.sensors
+    var sensors by remember(profile.id, savedSensors) { mutableStateOf(savedSensors) }
     var pinInput by remember(profile.id) { mutableStateOf("") }
     var pinError by remember(profile.id) { mutableStateOf<String?>(null) }
 
@@ -1149,11 +1164,15 @@ private fun VirtualLocationTab(profile: VmProfile, state: NovaUiState, vm: NovaV
     fun draft(): VirtualLocationConfig = VirtualLocationConfig(
         enabled = enabled,
         presetName = presetName,
-        latitude = latText.toDoubleOrNull() ?: gps.latitude,
-        longitude = lonText.toDoubleOrNull() ?: gps.longitude,
-        altitude = altText.toDoubleOrNull() ?: gps.altitude,
-        accuracyMeters = accuracyText.toFloatOrNull() ?: gps.accuracyMeters,
-        speedMps = speedText.toFloatOrNull() ?: gps.speedMps,
+        // `"NaN"` / `"Infinity"` are accepted by toDoubleOrNull(), and a non-finite
+        // coordinate would be persisted as 0.0 — teleporting the user to the Gulf
+        // of Guinea after a typo. Keep the last good value for anything non-finite.
+        latitude = latText.toDoubleOrNull()?.takeIf { it.isFinite() } ?: gps.latitude,
+        longitude = lonText.toDoubleOrNull()?.takeIf { it.isFinite() } ?: gps.longitude,
+        altitude = altText.toDoubleOrNull()?.takeIf { it.isFinite() } ?: gps.altitude,
+        accuracyMeters = accuracyText.toFloatOrNull()?.takeIf { it.isFinite() }
+            ?: gps.accuracyMeters,
+        speedMps = speedText.toFloatOrNull()?.takeIf { it.isFinite() } ?: gps.speedMps,
         bearingDegrees = gps.bearingDegrees,
         mode = mode,
         jitterEnabled = jitter,

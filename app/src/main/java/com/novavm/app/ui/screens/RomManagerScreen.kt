@@ -69,9 +69,12 @@ fun RomManagerScreen(
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
-        val arch = pendingArch
+        // `pendingArch` lives in composition state, so it is dropped when the
+        // activity is recreated while the SAF picker is on screen. Falling back
+        // to ARM64 keeps the chosen file from being silently ignored.
+        val arch = pendingArch ?: VmArchitecture.ARM64
         pendingArch = null
-        if (uri != null && arch != null) vm.importRom(uri, arch)
+        if (uri != null) vm.importRom(uri, arch)
     }
 
     LazyColumn(
