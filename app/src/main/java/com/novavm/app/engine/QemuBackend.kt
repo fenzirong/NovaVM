@@ -161,8 +161,26 @@ class QemuBackend(private val logger: (String) -> Unit = {}) : VmBackend {
         else -> 1
     }
 
-    fun diskFormatFor(path: String): String =
-        if (path.lowercase().endsWith(".qcow2")) "qcow2" else "raw"
+    /**
+     * Detects the `-drive format=` value for [path].
+     *
+     * A file that already exists wins over the file name: the QCOW2 magic is
+     * authoritative, because a `disk.qcow2` placeholder that was never converted
+     * is really a raw image and QEMU refuses to open it as QCOW2. The extension
+     * is only a hint for images that do not exist on disk yet.
+     */
+    fun diskFormatFor(path: String): String {
+        if (path.isBlank()) return "raw"
+        val file = File(path)
+        if (file.isFile) {
+            when (NativeEngine.probeDiskImage(path).format.lowercase(Locale.US)) {
+                "qcow2" -> return "qcow2"
+                "raw" -> return "raw"
+                // "missing"/unknown: fall through to the extension heuristic.
+            }
+        }
+        return if (path.lowercase(Locale.US).endsWith(".qcow2")) "qcow2" else "raw"
+    }
 
     /** Guest kernel command line, including NovaVM's androidboot contracts. */
     fun buildKernelCmdline(profile: VmProfile): String {

@@ -282,7 +282,7 @@ class RfbDisplayClient(
                 RfbProtocol.ENCODING_COPY_RECT -> {
                     val srcX = dataIn.readUnsignedShort()
                     val srcY = dataIn.readUnsignedShort()
-                    copyRect(srcX, srcY, x, y, rectWidth, rectHeight)
+                    readCopyRect(srcX, srcY, x, y, rectWidth, rectHeight)
                 }
                 RfbProtocol.ENCODING_DESKTOP_SIZE -> {
                     serverWidth = rectWidth
@@ -294,6 +294,21 @@ class RfbDisplayClient(
         return rectangles
     }
 
+    /**
+     * Byte distance from the start of [framebuffer] that rectangles may write
+     * to. Both `capacity` and `limit` are honoured so a guest that announces a
+     * larger desktop than the staging buffer simply gets clipped.
+     */
+    private fun destinationByteLimit(): Int =
+        minOf(framebuffer.capacity(), framebuffer.limit()).coerceAtLeast(0)
+
+    /**
+     * Decodes one Raw rectangle.
+     *
+     * The destination span is clipped to `[0, width)` instead of dropping the
+     * whole row when `x + rectWidth > width`, but every row is still read from
+     * [dataIn] so the RFB stream can never desynchronise.
+     */
     private fun readRawRect(
         dataIn: DataInputStream,
         x: Int,
@@ -303,20 +318,34 @@ class RfbDisplayClient(
     ) {
         val rowBytes = rectWidth * 4
         val scratch = if (rowBytes <= rowBuffer.size) rowBuffer else ByteArray(rowBytes)
+        val byteLimit = destinationByteLimit()
+        // Horizontal span the framebuffer can actually hold. The bytes outside
+        // it stay in `scratch` and are simply not blitted.
+        val clipFromX = maxOf(0, x)
+        val clipToX = minOf(width, x + rectWidth)
+        val clipWidth = clipToX - clipFromX
+        val scratchOffset = (clipFromX - x) * 4
         for (row in 0 until rectHeight) {
             dataIn.readFully(scratch, 0, rowBytes)
             val targetRow = y + row
-            if (targetRow !in 0 until height) continue
-            if (x < 0 || x + rectWidth > width) continue
-            val offset = (targetRow * width + x) * 4
-            if (offset < 0 || offset + rowBytes > framebuffer.capacity()) continue
+            if (targetRow !in 0 until height || clipWidth <= 0) continue
+            val offset = (targetRow * width + clipFromX) * 4
+            val length = clipWidth * 4
+            if (offset < 0 || offset + length > byteLimit) continue
             framebuffer.position(offset)
-            framebuffer.put(scratch, 0, rowBytes)
+            framebuffer.put(scratch, scratchOffset, length)
         }
         framebuffer.position(0)
     }
 
-    private fun copyRect(
+    /**
+     * Decodes one CopyRect rectangle.
+     *
+     * Rows are staged through a scratch buffer first, so overlapping moves and
+     * out-of-bounds source regions behave deterministically. Source and
+     * destination spans are both clipped to `[0, width)` x `[0, height)`.
+     */
+    private fun readCopyRect(
         srcX: Int,
         srcY: Int,
         dstX: Int,
@@ -324,26 +353,38 @@ class RfbDisplayClient(
         rectWidth: Int,
         rectHeight: Int
     ) {
-        val bytes = ByteArray(rectWidth * rectHeight * 4)
-        var cursor = 0
+        if (rectWidth <= 0 || rectHeight <= 0) return
+        val bytesPerPixel = 4
+        val rowBytes = rectWidth * bytesPerPixel
+        val rowScratch = ByteArray(rowBytes)
+        val byteLimit = destinationByteLimit()
+        val srcFromX = maxOf(0, srcX)
+        val srcToX = minOf(width, srcX + rectWidth)
+        val dstFromX = maxOf(0, dstX)
+        val dstToX = minOf(width, dstX + rectWidth)
+        val copyWidth = dstToX - dstFromX
+        // Only when the source row is not fully readable does the scratch carry
+        // stale bytes from the previous row.
+        val needsZeroFill = (srcToX - srcFromX) < rectWidth
+
         for (row in 0 until rectHeight) {
-            val srcOffset = ((srcY + row) * width + srcX) * 4
-            if (srcOffset < 0 || srcOffset + rectWidth * 4 > framebuffer.capacity()) {
-                cursor += rectWidth * 4
-                continue
+            val sourceRow = srcY + row
+            if (needsZeroFill || sourceRow !in 0 until height) rowScratch.fill(0)
+            if (sourceRow in 0 until height && srcToX > srcFromX) {
+                val srcOffset = (sourceRow * width + srcFromX) * bytesPerPixel
+                val srcLength = (srcToX - srcFromX) * bytesPerPixel
+                if (srcOffset >= 0 && srcOffset + srcLength <= byteLimit) {
+                    framebuffer.position(srcOffset)
+                    framebuffer.get(rowScratch, (srcFromX - srcX) * bytesPerPixel, srcLength)
+                }
             }
-            framebuffer.position(srcOffset)
-            framebuffer.get(bytes, cursor, rectWidth * 4)
-            cursor += rectWidth * 4
-        }
-        cursor = 0
-        for (row in 0 until rectHeight) {
-            val dstOffset = ((dstY + row) * width + dstX) * 4
-            if (dstOffset >= 0 && dstOffset + rectWidth * 4 <= framebuffer.capacity()) {
-                framebuffer.position(dstOffset)
-                framebuffer.put(bytes, cursor, rectWidth * 4)
-            }
-            cursor += rectWidth * 4
+            val targetRow = dstY + row
+            if (targetRow !in 0 until height || copyWidth <= 0) continue
+            val dstOffset = (targetRow * width + dstFromX) * bytesPerPixel
+            val dstLength = copyWidth * bytesPerPixel
+            if (dstOffset < 0 || dstOffset + dstLength > byteLimit) continue
+            framebuffer.position(dstOffset)
+            framebuffer.put(rowScratch, (dstFromX - dstX) * bytesPerPixel, dstLength)
         }
         framebuffer.position(0)
     }

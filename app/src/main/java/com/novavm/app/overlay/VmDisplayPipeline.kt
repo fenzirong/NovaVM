@@ -47,11 +47,42 @@ class VmDisplayPipeline(
     private val frameIntervalMs = (1000L / targetFps.coerceIn(5, 120))
     private val buffer: ByteBuffer =
         ByteBuffer.allocateDirect(width * height * 4).order(ByteOrder.LITTLE_ENDIAN)
-    private val rfbBuffer: ByteBuffer =
+
+    /**
+     * Guest framebuffer staging buffer. It starts at the pipeline geometry and
+     * is re-allocated to the *guest* geometry right after the RFB handshake,
+     * which can be much larger (720x1280, 1080x1920, ...). Keeping the guest
+     * size here is what stops oversized guests from black-screening: the raw
+     * decoder never clips the right/bottom edges, and [blitRfb] scales the
+     * frame onto the Surface.
+     */
+    private var rfbBuffer: ByteBuffer =
         ByteBuffer.allocateDirect(width * height * 4).order(ByteOrder.LITTLE_ENDIAN)
+    private val rfbLock = Any()
+
+    /** Pixel geometry of [rfbBuffer]; equals [width]x[height] until resized. */
+    @Volatile var rfbWidth: Int = width
+        private set
+    @Volatile var rfbHeight: Int = height
+        private set
+
+    /** Server geometry captured at handshake; a later change means DESKTOP_SIZE. */
+    @Volatile private var rfbHandshakeWidth: Int = width
+    @Volatile private var rfbHandshakeHeight: Int = height
+
+    /**
+     * Geometry currently visible on the surface: the guest framebuffer while
+     * RFB is live (it may be 720x1280 / 1080x1920, larger than the pipeline),
+     * otherwise the boot console geometry. Touch mapping uses this so pointer
+     * coordinates stay in guest space after the resize.
+     */
+    val displayWidth: Int get() = if (rfbConnected) rfbWidth else width
+    val displayHeight: Int get() = if (rfbConnected) rfbHeight else height
+
     private val canvasBitmap: Bitmap by lazy {
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     }
+    private var rfbBitmap: Bitmap? = null
     private val canvasPaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     val console: BootConsoleRenderer = BootConsoleRenderer(width, height)
@@ -163,14 +194,12 @@ class VmDisplayPipeline(
             }
             val liveRfb = rfb
             if (liveRfb != null && liveRfb.isConnected) {
-                if (rfbDirty) {
-                    rfbBuffer.position(0)
-                    buffer.clear()
-                    buffer.put(rfbBuffer)
-                    buffer.position(0)
-                    rfbDirty = false
-                }
                 source = Source.RFB
+                // Blit straight from rfbBuffer, which already carries the guest
+                // geometry: matching sizes take the native path, oversized guests
+                // are scaled onto the Surface instead of black-screening.
+                blitRfb(surface)
+                rfbDirty = false
             } else {
                 source = Source.CONSOLE
                 // The fallback console is painted at a steady 30fps; the buffer
@@ -181,11 +210,10 @@ class VmDisplayPipeline(
                     lastConsoleRenderMs = frameStart
                     synchronized(console) { console.render(buffer, frameStart) }
                 }
-            }
-
-            val attached = attachedSurface
-            if (attached != null && attached.isValid) {
-                blit(attached)
+                val attached = attachedSurface
+                if (attached != null && attached.isValid) {
+                    blitConsole(attached)
+                }
             }
 
             frames++
@@ -202,7 +230,8 @@ class VmDisplayPipeline(
         }
     }
 
-    private fun blit(surface: Surface) {
+    /** Blits the boot console buffer, which always matches [width]x[height]. */
+    private fun blitConsole(surface: Surface) {
         buffer.position(0)
         if (NativeEngine.blitFramebuffer(surface, buffer, width, height)) {
             buffer.position(0)
@@ -226,6 +255,59 @@ class VmDisplayPipeline(
         }.onFailure {
             onLog("canvas blit failed: ${it.message}")
         }
+    }
+
+    /**
+     * Blits one guest frame out of [rfbBuffer]. Matching geometry keeps the
+     * zero-copy native upload; a guest that is larger than the pipeline
+     * (720x1280, 1080x1920, ...) is scaled with `Canvas.drawBitmap(src, dst)`
+     * so oversized resolutions never end up as a black screen.
+     */
+    private fun blitRfb(surface: Surface) {
+        val guestWidth = rfbWidth
+        val guestHeight = rfbHeight
+        if (guestWidth <= 0 || guestHeight <= 0) return
+        synchronized(rfbLock) {
+            val nativeGeometry = guestWidth == width && guestHeight == height
+            if (nativeGeometry) {
+                rfbBuffer.position(0)
+                if (NativeEngine.blitFramebuffer(surface, rfbBuffer, guestWidth, guestHeight)) {
+                    rfbBuffer.position(0)
+                    return
+                }
+            }
+            rfbBuffer.position(0)
+            runCatching {
+                val bitmap = rfbBitmapFor(guestWidth, guestHeight)
+                rfbBuffer.position(0)
+                bitmap.copyPixelsFromBuffer(rfbBuffer)
+                rfbBuffer.position(0)
+                val canvas = surface.lockCanvas(null) ?: return
+                try {
+                    canvas.drawBitmap(
+                        bitmap,
+                        Rect(0, 0, guestWidth, guestHeight),
+                        Rect(0, 0, canvas.width, canvas.height),
+                        canvasPaint
+                    )
+                } finally {
+                    surface.unlockCanvasAndPost(canvas)
+                }
+            }.onFailure {
+                onLog("rfb canvas blit failed: ${it.message}")
+            }
+        }
+    }
+
+    /** Lazily (re)allocates the guest-sized bitmap used for scaled blits. */
+    private fun rfbBitmapFor(guestWidth: Int, guestHeight: Int): Bitmap {
+        val existing = rfbBitmap
+        if (existing != null && existing.width == guestWidth && existing.height == guestHeight) {
+            return existing
+        }
+        existing?.recycle()
+        return Bitmap.createBitmap(guestWidth, guestHeight, Bitmap.Config.ARGB_8888)
+            .also { rfbBitmap = it }
     }
 
     private fun startRfbPump() {
@@ -306,11 +388,30 @@ class VmDisplayPipeline(
             try {
                 client.requestUpdate(incremental = rfbDirty)
                 client.readUpdate()
-                synchronized(rfbBuffer) {
-                    rfbBuffer.position(0)
-                    client.framebuffer.position(0)
-                    rfbBuffer.put(client.framebuffer)
-                    rfbBuffer.position(0)
+                if (client.serverWidth != rfbHandshakeWidth ||
+                    client.serverHeight != rfbHandshakeHeight
+                ) {
+                    // Desktop resize (DESKTOP_SIZE encoding) after the handshake:
+                    // reattach so the staging buffer is rebuilt at the new guest
+                    // geometry instead of clipping every frame.
+                    onLog(
+                        "guest resized to ${client.serverWidth}x${client.serverHeight}; reattaching"
+                    )
+                    rfbConnected = false
+                    rfbServerLabel = ""
+                    runCatching { client.close() }
+                    rfb = null
+                    continue
+                }
+                synchronized(rfbLock) {
+                    val frame = client.framebuffer
+                    if (rfbBuffer.capacity() >= frame.capacity()) {
+                        rfbBuffer.position(0)
+                        frame.position(0)
+                        rfbBuffer.put(frame)
+                        rfbBuffer.position(0)
+                        frame.position(0)
+                    }
                 }
                 rfbDirty = true
             } catch (error: Throwable) {
@@ -331,16 +432,38 @@ class VmDisplayPipeline(
     }
 
     private fun tryConnect(): Boolean {
-        val probe = RfbDisplayClient(
-            host = HOST,
-            port = vncPort,
-            width = width,
-            height = height,
-            connectTimeoutMs = 900,
-            readTimeoutMs = 3_000
-        )
+        var probe = newClient(width, height)
         return try {
             probe.connect()
+
+            // The guest normally brings its own resolution up (720x1280,
+            // 1080x1920, ...). Reattach at the advertised geometry so the raw
+            // decoder never clips the right/bottom edges, then rebuild the
+            // staging buffer for it.
+            val guestWidth = probe.serverWidth
+            val guestHeight = probe.serverHeight
+            if (guestWidth != width || guestHeight != height) {
+                if (isSupportedGeometry(guestWidth, guestHeight)) {
+                    val resized = newClient(guestWidth, guestHeight)
+                    try {
+                        resized.connect()
+                        runCatching { probe.close() }
+                        probe = resized
+                    } catch (error: Throwable) {
+                        runCatching { resized.close() }
+                        onLog(
+                            "guest ${guestWidth}x${guestHeight} reattach failed: " +
+                                (error.message ?: error.javaClass.simpleName)
+                        )
+                    }
+                } else {
+                    onLog("guest framebuffer ${guestWidth}x$guestHeight out of range; using $width x $height")
+                }
+            }
+            allocateRfbBuffer(probe.width, probe.height)
+            rfbHandshakeWidth = probe.serverWidth
+            rfbHandshakeHeight = probe.serverHeight
+
             rfb = probe
             rfbConnected = true
             rfbServerLabel = probe.serverName.ifBlank { "RFB ${probe.serverWidth}x${probe.serverHeight}" }
@@ -350,7 +473,7 @@ class VmDisplayPipeline(
                 console.setStatus("RFB LIVE", "Connected to $label")
                 console.appendLine("[ OK ] RFB attached at $HOST:$vncPort")
             }
-            onLog("attached to guest framebuffer at $HOST:$vncPort")
+            onLog("attached to guest framebuffer at $HOST:$vncPort (${probe.width}x${probe.height})")
             rfbDirty = true
             true
         } catch (error: Throwable) {
@@ -359,27 +482,98 @@ class VmDisplayPipeline(
         }
     }
 
+    private fun newClient(guestWidth: Int, guestHeight: Int): RfbDisplayClient =
+        RfbDisplayClient(
+            host = HOST,
+            port = vncPort,
+            width = guestWidth,
+            height = guestHeight,
+            connectTimeoutMs = 900,
+            readTimeoutMs = 3_000
+        )
+
+    /**
+     * Re-allocates [rfbBuffer] for the guest geometry and publishes
+     * [rfbWidth]/[rfbHeight], which [blitRfb] uses to pick native upload
+     * (matching size) or Canvas scaling (oversized guest).
+     */
+    private fun allocateRfbBuffer(guestWidth: Int, guestHeight: Int) {
+        val required = guestWidth.toLong() * guestHeight.toLong() * 4L
+        if (required <= 0L) return
+        synchronized(rfbLock) {
+            if (rfbBuffer.capacity() < required) {
+                rfbBuffer = ByteBuffer.allocateDirect(required.toInt()).order(ByteOrder.LITTLE_ENDIAN)
+            }
+            rfbBuffer.position(0)
+            rfbWidth = guestWidth
+            rfbHeight = guestHeight
+        }
+        rfbDirty = false
+    }
+
+    private fun isSupportedGeometry(guestWidth: Int, guestHeight: Int): Boolean =
+        guestWidth in MIN_GUEST_DIMENSION..MAX_GUEST_DIMENSION &&
+            guestHeight in MIN_GUEST_DIMENSION..MAX_GUEST_DIMENSION
+
     private fun sleepQuietly(millis: Long) {
         runCatching { Thread.sleep(millis) }
     }
 
     /** Stops every daemon (boot sequence, render, RFB) and releases the surface. */
     fun stop() {
+        val workers = shutdown()
+        runCatching { workers.boot?.join(BOOT_JOIN_MS) }
+        runCatching { workers.render?.join(RENDER_JOIN_MS) }
+        runCatching { workers.rfb?.join(RFB_JOIN_MS) }
+    }
+
+    /**
+     * Non-blocking teardown for lifecycle callbacks: flips `running`, closes the
+     * RFB socket, interrupts the daemons and detaches the surface immediately,
+     * then joins them on a throw-away daemon thread so `onDestroy` never blocks
+     * the main thread on a socket read or a pending frame. [stop] stays the
+     * deterministic, fully-joined variant used by tests.
+     */
+    fun stopAsync() {
+        val workers = shutdown()
+        if (workers.isEmpty) return
+        Thread({
+            runCatching { workers.boot?.join(BOOT_JOIN_MS) }
+            runCatching { workers.rfb?.join(RFB_JOIN_MS) }
+            runCatching { workers.render?.join(RENDER_JOIN_MS) }
+        }, "NovaVM-DisplayStop").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** Flips the run flag, drops the RFB link and interrupts every daemon. */
+    private fun shutdown(): Teardown {
         running = false
-        runCatching { rfb?.close() }
+        val client = rfb
         rfb = null
         rfbConnected = false
+        runCatching { client?.close() }
 
         val boot = bootThread
+        val render = renderThread
+        val rfbWorker = rfbThread
         bootThread = null
-        boot?.interrupt()
-        runCatching { boot?.join(BOOT_JOIN_MS) }
-
-        runCatching { renderThread?.join(600) }
-        runCatching { rfbThread?.interrupt() }
         renderThread = null
         rfbThread = null
         attachedSurface = null
+
+        runCatching { boot?.interrupt() }
+        runCatching { rfbWorker?.interrupt() }
+        return Teardown(boot, render, rfbWorker)
+    }
+
+    private class Teardown(
+        val boot: Thread?,
+        val render: Thread?,
+        val rfb: Thread?
+    ) {
+        val isEmpty: Boolean get() = boot == null && render == null && rfb == null
     }
 
     override fun close() {
@@ -390,6 +584,12 @@ class VmDisplayPipeline(
         const val HOST = "127.0.0.1"
         private const val CONSOLE_FRAME_MS = 33L
         private const val BOOT_JOIN_MS = 800L
+        private const val RENDER_JOIN_MS = 600L
+        private const val RFB_JOIN_MS = 600L
+
+        /** Guest geometry accepted for the staging buffer (guards allocation). */
+        private const val MIN_GUEST_DIMENSION = 64
+        private const val MAX_GUEST_DIMENSION = 4096
 
         /**
          * Keeps software console rendering smooth: scales any guest resolution

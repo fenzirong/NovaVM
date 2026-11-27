@@ -157,7 +157,10 @@ class VmDisplayActivity : ComponentActivity() {
 
         val runtime = application.vmInstanceManager.state(loaded.id)
         if (runtime?.isRunning != true) {
-            application.vmInstanceManager.start(loaded.id)
+            // Engine boot probes QEMU/sockets: never on the main thread.
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { application.vmInstanceManager.start(loaded.id) }
+            }
         }
         backendLabel = application.vmInstanceManager.state(loaded.id)?.backendName ?: loaded.backendType.name
 
@@ -281,7 +284,9 @@ class VmDisplayActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        pipeline?.close()
+        // Non-blocking teardown: the pipeline detaches the surface immediately
+        // and joins its daemons on its own thread.
+        pipeline?.stopAsync()
         pipeline = null
         super.onDestroy()
     }
@@ -388,9 +393,18 @@ class VmDisplayActivity : ComponentActivity() {
 
     private fun powerOff() {
         val loaded = profile ?: return
-        app?.vmInstanceManager?.stop(loaded.id)
+        val manager = app?.vmInstanceManager
         pipeline?.appendConsole("[ OK ] power off requested")
-        finishAndRemoveTask()
+        if (manager == null) {
+            finishAndRemoveTask()
+            return
+        }
+        // Shutting the guest down can take seconds: keep the main thread free
+        // and only leave the task once the engine acknowledged the stop.
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { manager.stop(loaded.id) }
+            withContext(Dispatchers.Main) { finishAndRemoveTask() }
+        }
     }
 
     /**
@@ -945,14 +959,18 @@ private fun handlePipelineTouch(
     event: MotionEvent
 ): Boolean {
     if (view.width == 0 || view.height == 0) return false
+    // Guest space while RFB is live (oversized guests keep their own geometry),
+    // console space otherwise.
+    val frameWidth = pipeline.displayWidth.coerceAtLeast(1)
+    val frameHeight = pipeline.displayHeight.coerceAtLeast(1)
     val scale = min(
-        view.width.toFloat() / pipeline.width,
-        view.height.toFloat() / pipeline.height
+        view.width.toFloat() / frameWidth,
+        view.height.toFloat() / frameHeight
     ).coerceAtLeast(0.01f)
-    val offsetX = (view.width - pipeline.width * scale) / 2f
-    val offsetY = (view.height - pipeline.height * scale) / 2f
-    val fbX = ((event.x - offsetX) / scale).roundToInt().coerceIn(0, pipeline.width - 1)
-    val fbY = ((event.y - offsetY) / scale).roundToInt().coerceIn(0, pipeline.height - 1)
+    val offsetX = (view.width - frameWidth * scale) / 2f
+    val offsetY = (view.height - frameHeight * scale) / 2f
+    val fbX = ((event.x - offsetX) / scale).roundToInt().coerceIn(0, frameWidth - 1)
+    val fbY = ((event.y - offsetY) / scale).roundToInt().coerceIn(0, frameHeight - 1)
     when (event.actionMasked) {
         MotionEvent.ACTION_DOWN -> pipeline.sendPointer(1, fbX, fbY)
         MotionEvent.ACTION_MOVE -> pipeline.sendPointer(1, fbX, fbY)

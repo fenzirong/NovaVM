@@ -30,6 +30,12 @@ import com.novavm.app.R
 import com.novavm.app.data.VmProfile
 import com.novavm.app.engine.HostCapabilities
 import com.novavm.app.engine.RfbProtocol
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.hypot
 
 /**
@@ -43,6 +49,12 @@ class FloatingVmService : Service() {
     private var profile: VmProfile? = null
     private var pipeline: VmDisplayPipeline? = null
 
+    /**
+     * Main-thread scope for the start sequence: repository/engine work hops to
+     * [Dispatchers.IO] and comes back here to touch views and the notification.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     private var windowView: View? = null
     private var windowParams: WindowManager.LayoutParams? = null
     private var bubbleView: View? = null
@@ -53,10 +65,16 @@ class FloatingVmService : Service() {
         super.onCreate()
         windowManager = getSystemService(WindowManager::class.java)
         app = application as NovaVmApp
-        ensureChannel()
+        ensureNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Promote to foreground first: a START_STICKY service that does disk IO
+        // (or returns early) before startForeground() is eligible for an
+        // "did not call startForeground" kill / ANR.
+        ensureNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification("NovaVM", "正在启动悬浮窗…"))
+
         if (intent?.action == ACTION_CLOSE) {
             stopSelf()
             return START_NOT_STICKY
@@ -68,32 +86,41 @@ class FloatingVmService : Service() {
         }
 
         val application = app ?: return START_NOT_STICKY
-        val vmId = intent?.getStringExtra(EXTRA_VM_ID)
-            ?: application.vmRepository.loadAll().firstOrNull()?.id
-        val loaded = vmId?.let { application.vmRepository.get(it) }
-        if (loaded == null) {
-            Toast.makeText(this, "找不到虚拟机", Toast.LENGTH_SHORT).show()
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        profile = loaded
-        application.setActiveVm(loaded.id)
-        if (application.vmInstanceManager.state(loaded.id)?.isRunning != true) {
-            application.vmInstanceManager.start(loaded.id)
-        }
+        val requestedVmId = intent?.getStringExtra(EXTRA_VM_ID)
 
-        startForeground(NOTIFICATION_ID, buildNotification(loaded))
-        ensurePipeline(loaded)
-        showWindow(loaded)
+        scope.launch {
+            // VM profile lookup hits the on-disk store; never on the main thread.
+            val loaded = withContext(Dispatchers.IO) {
+                val vmId = requestedVmId ?: application.vmRepository.loadAll().firstOrNull()?.id
+                vmId?.let { application.vmRepository.get(it) }
+            }
+            if (loaded == null) {
+                Toast.makeText(this@FloatingVmService, "找不到虚拟机", Toast.LENGTH_SHORT).show()
+                stopSelf()
+                return@launch
+            }
+            profile = loaded
+            application.setActiveVm(loaded.id)
+            // Engine start probes QEMU/socket state: keep it off the main thread.
+            withContext(Dispatchers.IO) {
+                if (application.vmInstanceManager.state(loaded.id)?.isRunning != true) {
+                    application.vmInstanceManager.start(loaded.id)
+                }
+            }
+            ensurePipeline(loaded)
+            showWindow(loaded)
+            notifyStatus(loaded)
+        }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        scope.cancel()
         removeWindow()
         removeBubble()
-        pipeline?.close()
+        pipeline?.stopAsync()
         pipeline = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -332,14 +359,17 @@ class FloatingVmService : Service() {
     private fun forwardTouch(view: View, event: MotionEvent): Boolean {
         val display = pipeline ?: return false
         if (view.width == 0 || view.height == 0) return false
+        // Guest space while RFB is live, console space otherwise.
+        val frameWidth = display.displayWidth.coerceAtLeast(1)
+        val frameHeight = display.displayHeight.coerceAtLeast(1)
         val scale = minOf(
-            view.width.toFloat() / display.width,
-            view.height.toFloat() / display.height
+            view.width.toFloat() / frameWidth,
+            view.height.toFloat() / frameHeight
         ).coerceAtLeast(0.01f)
-        val offsetX = (view.width - display.width * scale) / 2f
-        val offsetY = (view.height - display.height * scale) / 2f
-        val fbX = ((event.x - offsetX) / scale).toInt().coerceIn(0, display.width - 1)
-        val fbY = ((event.y - offsetY) / scale).toInt().coerceIn(0, display.height - 1)
+        val offsetX = (view.width - frameWidth * scale) / 2f
+        val offsetY = (view.height - frameHeight * scale) / 2f
+        val fbX = ((event.x - offsetX) / scale).toInt().coerceIn(0, frameWidth - 1)
+        val fbY = ((event.y - offsetY) / scale).toInt().coerceIn(0, frameHeight - 1)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> display.sendPointer(1, fbX, fbY)
             MotionEvent.ACTION_MOVE -> display.sendPointer(1, fbX, fbY)
@@ -443,7 +473,7 @@ class FloatingVmService : Service() {
 
     // -------------------------------------------------------- notification
 
-    private fun ensureChannel() {
+    private fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
@@ -458,12 +488,31 @@ class FloatingVmService : Service() {
         manager.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(profile: VmProfile): Notification {
+    /** Re-publishes the progress notification once the VM profile is resolved. */
+    private fun notifyStatus(profile: VmProfile) {
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        runCatching {
+            manager.notify(
+                NOTIFICATION_ID,
+                buildNotification(
+                    getString(R.string.floating_notification_title),
+                    profile.displayName,
+                    profile.id
+                )
+            )
+        }
+    }
+
+    private fun buildNotification(
+        title: String,
+        text: String,
+        vmId: String? = null
+    ): Notification {
         val openIntent = PendingIntent.getActivity(
             this,
             0,
             Intent(this, VmDisplayActivity::class.java)
-                .putExtra(VmDisplayActivity.EXTRA_VM_ID, profile.id),
+                .putExtra(VmDisplayActivity.EXTRA_VM_ID, vmId ?: profile?.id.orEmpty()),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val closeIntent = PendingIntent.getService(
@@ -474,8 +523,8 @@ class FloatingVmService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_novavm)
-            .setContentTitle(getString(R.string.floating_notification_title))
-            .setContentText(profile.displayName)
+            .setContentTitle(title)
+            .setContentText(text)
             .setOngoing(true)
             .setSilent(true)
             .setContentIntent(openIntent)

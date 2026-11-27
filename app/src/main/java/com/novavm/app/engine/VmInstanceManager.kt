@@ -44,9 +44,11 @@ data class VmRuntimeState(
 /**
  * Thread-safe controller for every VM known to the app.
  *
- * Batch 1 does not spawn QEMU processes yet: [start] builds the exact argv,
- * records it in the console log and transitions the runtime state so the UI
- * (and Batch 2's process supervisor) has a stable state machine to drive.
+ * [start] builds the exact argv, records it in the console log, spawns the
+ * `qemu-system-*` process when the host exposes an executable binary and
+ * transitions the runtime state. While a real process is alive, pause/resume and
+ * snapshot restore are driven over QMP; without one the same calls degrade to
+ * console-only feedback so the state machine stays usable on every host.
  */
 class VmInstanceManager(
     val repository: VmRepository,
@@ -333,23 +335,36 @@ class VmInstanceManager(
     }
 
     fun pause(vmId: String): Boolean {
-        synchronized(lock) {
+        val runtimeState = synchronized(lock) {
             val current = state(vmId) ?: return false
             if (current.status != VmStatus.RUNNING) return false
-            update(vmId) { it.copy(status = VmStatus.PAUSED) }
-            appendConsole(vmId, "VM paused (QMP stop requested)")
-            return true
+            current
         }
+        val port = repository.get(vmId)?.qmpPort ?: runtimeState.qmpPort
+        // null => no live qemu process, keep the console-only fallback path.
+        val applied = runQmpCommand(vmId, port, "stop") { it.stop() }
+        if (applied == false) return false
+        if (applied == null) appendConsole(vmId, "VM paused (QMP stop requested)")
+        synchronized(lock) {
+            update(vmId) { it.copy(status = VmStatus.PAUSED) }
+        }
+        return true
     }
 
     fun resume(vmId: String): Boolean {
-        synchronized(lock) {
+        val runtimeState = synchronized(lock) {
             val current = state(vmId) ?: return false
             if (current.status != VmStatus.PAUSED) return false
-            update(vmId) { it.copy(status = VmStatus.RUNNING) }
-            appendConsole(vmId, "VM resumed (QMP cont requested)")
-            return true
+            current
         }
+        val port = repository.get(vmId)?.qmpPort ?: runtimeState.qmpPort
+        val applied = runQmpCommand(vmId, port, "cont") { it.cont() }
+        if (applied == false) return false
+        if (applied == null) appendConsole(vmId, "VM resumed (QMP cont requested)")
+        synchronized(lock) {
+            update(vmId) { it.copy(status = VmStatus.RUNNING) }
+        }
+        return true
     }
 
     fun markError(vmId: String, message: String): Boolean {
@@ -378,6 +393,13 @@ class VmInstanceManager(
     fun restoreSnapshot(vmId: String, snapshotId: String): Boolean {
         val snapshot = repository.findSnapshot(vmId, snapshotId) ?: return false
         appendConsole(vmId, "Restoring snapshot ${snapshot.name} via QMP loadvm")
+        val port = repository.get(vmId)?.qmpPort ?: state(vmId)?.qmpPort
+        // No live guest => the console line above stays the whole story.
+        if (port != null) {
+            runQmpCommand(vmId, port, "loadvm ${snapshot.name}") {
+                it.loadSnapshot(snapshot.name)
+            }
+        }
         return true
     }
 
@@ -435,8 +457,57 @@ class VmInstanceManager(
         when (profile.backendType) {
             VmBackendType.QEMU -> qemuBackend
             VmBackendType.AVF -> if (avfBackend.isSupported(capabilities)) avfBackend else qemuBackend
-            VmBackendType.AUTO -> if (avfBackend.isSupported(capabilities)) avfBackend else qemuBackend
+            // AVF does not execute a real guest process yet, so an automatic
+            // choice must stay on QEMU; AVF remains available for profiles that
+            // explicitly ask for it.
+            VmBackendType.AUTO -> qemuBackend
         }
+
+    /**
+     * Sends one QMP command to the VM's monitor socket when a real qemu-system
+     * process is alive for it.
+     *
+     * @return `null` when no live guest process owns [vmId] — callers then keep
+     * their console-only fallback wording; `true` when the monitor accepted the
+     * command; `false` when the transport or the command itself failed.
+     */
+    private fun runQmpCommand(
+        vmId: String,
+        port: Int,
+        label: String,
+        action: (QmpClient) -> QmpResponse
+    ): Boolean? {
+        val alive = synchronized(lock) { processes[vmId]?.isAlive == true }
+        if (!alive) return null
+        return runCatching {
+            QmpClient(port = port).use { client ->
+                client.connect()
+                action(client)
+            }
+        }.fold(
+            onSuccess = { response ->
+                val rejection = if (response.isError) {
+                    response.errorMessage ?: response.raw
+                } else {
+                    null
+                }
+                if (rejection != null) {
+                    appendConsole(vmId, "[FAIL] QMP $label rejected: $rejection")
+                    false
+                } else {
+                    appendConsole(vmId, "[ OK ] QMP $label on 127.0.0.1:$port")
+                    true
+                }
+            },
+            onFailure = { error ->
+                appendConsole(vmId, "[FAIL] QMP $label failed: ${reasonOf(error)}")
+                false
+            }
+        )
+    }
+
+    private fun reasonOf(error: Throwable): String =
+        error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.simpleName
 
     private fun writeLaunchLog(vmId: String, command: List<String>) {
         runCatching {

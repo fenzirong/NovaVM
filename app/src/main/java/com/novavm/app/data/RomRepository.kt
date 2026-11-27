@@ -31,6 +31,9 @@ class RomRepository(
     val imagesDir: File = File(romsDir, "images")
     val indexFile: File = File(romsDir, "roms.json")
 
+    /** Last known-good snapshot of [indexFile], refreshed on every save. */
+    val indexBackupFile: File = File(romsDir, "roms.json.bak")
+
     /** Static catalogue of freely redistributable images. */
     val catalog: List<RomCatalogItem> = builtInCatalog()
 
@@ -132,22 +135,48 @@ class RomRepository(
     @Synchronized
     fun loadAll(): List<ImportedRom> {
         if (!indexFile.exists()) return emptyList()
-        return runCatching {
-            json.decodeFromString<ImportedRomFile>(indexFile.readText(Charsets.UTF_8)).roms
-        }.getOrElse {
+        val raw = JsonPersistence.readOrNull(indexFile) ?: return emptyList()
+        if (raw.isBlank()) return emptyList()
+        parseRoms(raw)?.let { return it }
+
+        // The index exists and is non-empty, yet does not parse. Recover the last
+        // good catalogue instead of pretending the user imported nothing, and
+        // keep the unreadable bytes aside so a later save cannot destroy them.
+        val recovered = JsonPersistence.readOrNull(indexBackupFile)?.let(::parseRoms)
+        JsonPersistence.preserveCorrupt(indexFile, clock())
+        if (recovered != null) {
+            // Repair the index so the next save starts from good state again.
             runCatching {
-                json.decodeFromString<List<ImportedRom>>(indexFile.readText(Charsets.UTF_8))
-            }.getOrDefault(emptyList())
+                JsonPersistence.writeAtomically(indexFile, encodeRoms(recovered))
+            }
+            return recovered
         }
+        return emptyList()
     }
 
     @Synchronized
     fun saveAll(roms: List<ImportedRom>) {
         ensureDirs()
-        indexFile.writeText(
-            json.encodeToString(ImportedRomFile(roms = roms)),
-            Charsets.UTF_8
-        )
+        // Only a parseable index is worth keeping as the fallback snapshot; a
+        // corrupt one must not overwrite the last good backup.
+        JsonPersistence.backupIfValid(indexFile, indexBackupFile) { parseRoms(it) != null }
+        JsonPersistence.writeAtomically(indexFile, encodeRoms(roms))
+    }
+
+    private fun encodeRoms(roms: List<ImportedRom>): String =
+        json.encodeToString(ImportedRomFile(roms = roms))
+
+    /** Parses an import index, or null when [raw] cannot be decoded. */
+    private fun parseRoms(raw: String): List<ImportedRom>? {
+        if (raw.isBlank()) return null
+        runCatching { json.decodeFromString<ImportedRomFile>(raw).roms }
+            .getOrNull()
+            ?.let { return it }
+        // Tolerate a bare JSON array written by older builds.
+        runCatching { json.decodeFromString<List<ImportedRom>>(raw) }
+            .getOrNull()
+            ?.let { return it }
+        return null
     }
 
     fun imported(): List<ImportedRom> = loadAll()

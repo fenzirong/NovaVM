@@ -40,8 +40,11 @@ data class AvfLaunchDescriptor(
  * classes only exist on Android 13+ devices shipping pKVM, so they are probed
  * reflectively. When the stack is missing, [buildLaunchCommand] transparently
  * falls back to [QemuBackend] and [probe] explains why.
+ *
+ * The class is `open` so tests can substitute [virtualMachineManagerClass] and
+ * exercise the AVF-usable branches on a plain JVM.
  */
-class AvfBackend(
+open class AvfBackend(
     private val fallback: QemuBackend = QemuBackend()
 ) : VmBackend {
 
@@ -61,7 +64,7 @@ class AvfBackend(
     }
 
     /** Looks up the platform class without a compile-time dependency. */
-    fun virtualMachineManagerClass(): Class<*>? =
+    open fun virtualMachineManagerClass(): Class<*>? =
         runCatching { Class.forName(VIRTUAL_MACHINE_MANAGER, false, javaClass.classLoader) }
             .getOrNull()
 
@@ -105,8 +108,12 @@ class AvfBackend(
         json.encodeToString(buildLaunchDescriptor(profile, capabilities))
 
     /**
-     * Emits an `avf://` descriptor when AVF is usable, otherwise the QEMU argv
-     * so callers always have something runnable.
+     * Emits the QEMU argv whenever QEMU can actually execute the guest.
+     *
+     * AVF does not spawn a guest process yet, so an `avf://launch` descriptor
+     * would be unexecutable; a present qemu-system binary always wins. The
+     * `avf://` stub is only produced when QEMU is unavailable *and* the AVF
+     * stack is usable.
      */
     override fun buildLaunchCommand(
         profile: VmProfile,
@@ -115,7 +122,7 @@ class AvfBackend(
         logDir: File?,
         binaryPath: String?
     ): List<String> {
-        if (!isSupported(capabilities)) {
+        if (!isSupported(capabilities) || capabilities.qemuBinaryPresent) {
             return fallback.buildLaunchCommand(profile, capabilities, sharedDir, logDir, binaryPath)
         }
         return listOf(
@@ -128,7 +135,13 @@ class AvfBackend(
     }
 
     /** Human-readable explanation of why QEMU is used instead. */
-    fun fallbackNotice(capabilities: HostCapabilities): String? =
-        if (isSupported(capabilities)) null
-        else "${probe(capabilities).detail}; falling back to ${fallback.backendName}"
+    fun fallbackNotice(capabilities: HostCapabilities): String? = when {
+        !isSupported(capabilities) ->
+            "${probe(capabilities).detail}; falling back to ${fallback.backendName}"
+
+        capabilities.qemuBinaryPresent ->
+            "AVF cannot execute a guest process yet; launching through ${fallback.backendName}"
+
+        else -> null
+    }
 }
